@@ -32,7 +32,7 @@ const settings = ref<PrompterSettings>({
   enableAutoScroll: props.initialSettings.enableAutoScroll ?? true,
   enableVoice: props.initialSettings.enableVoice ?? true,
   scrollSpeed: props.initialSettings.scrollSpeed || 3,
-  showGuideLine: false,
+  showGuideLine: true,
   mirrorH: false,
   mirrorV: false
 });
