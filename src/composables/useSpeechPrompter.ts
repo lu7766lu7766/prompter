@@ -190,6 +190,29 @@ export function useSpeechPrompter() {
 
     tokens.value = list;
     currentTokenIndex.value = -1;
+    buildCleanedCache();
+  }
+
+  // 全文快取字串與字元對齊對應表（支援快速遠程跳段搜尋）
+  let fullCleanedText = '';
+  let fullTokenMap: number[] = [];
+  let tokenFirstCharIndex: number[] = [];
+
+  function buildCleanedCache() {
+    fullCleanedText = '';
+    fullTokenMap = [];
+    tokenFirstCharIndex = new Array(tokens.value.length).fill(0);
+
+    tokens.value.forEach((tok) => {
+      tokenFirstCharIndex[tok.id] = fullCleanedText.length;
+      if (!tok.isPunctuationOrSpace) {
+        const cleaned = cleanText(tok.text);
+        for (let c = 0; c < cleaned.length; c++) {
+          fullCleanedText += cleaned[c];
+          fullTokenMap.push(tok.id);
+        }
+      }
+    });
   }
 
   // 規範化文字（去除標點、空白並轉小寫）
@@ -199,64 +222,102 @@ export function useSpeechPrompter() {
       .replace(/[，。！？、；：「」『』（）《》〈〉—…,.!?;:()\[\]"' \t\r\n]/g, '');
   }
 
-  // 比對語音轉錄內容與文稿位置（滑動窗口對齊演算法）
+  // 比對語音轉錄內容與文稿位置（雙層階層搜尋：局部精確追蹤 + 遠距跳段跳篇搜尋）
   function matchTranscript(transcript: string) {
     const cleanedTranscript = cleanText(transcript);
-    if (!cleanedTranscript || tokens.value.length === 0) return;
+    if (!cleanedTranscript || fullCleanedText.length === 0) return;
 
     lastRecognizedText.value = transcript;
 
-    const startIdx = Math.max(0, currentTokenIndex.value);
-    const windowSize = 45; // 往前搜尋最多 45 個有效字元
-    const searchTokens = tokens.value.slice(startIdx, startIdx + windowSize);
+    // 取得當前朗讀進度在全文中的字元索引
+    const currentIdx = currentTokenIndex.value;
+    let currentCharPos = 0;
+    if (currentIdx >= 0 && currentIdx < tokenFirstCharIndex.length) {
+      currentCharPos = tokenFirstCharIndex[currentIdx];
+    }
 
-    // 建立候選字串
-    let candidateChars = '';
-    const tokenIndexMap: number[] = [];
+    let matchCharIndex = -1;
 
-    searchTokens.forEach((tok, offset) => {
-      if (!tok.isPunctuationOrSpace) {
-        const cleaned = cleanText(tok.text);
-        for (let c = 0; c < cleaned.length; c++) {
-          candidateChars += cleaned[c];
-          tokenIndexMap.push(startIdx + offset);
-        }
-      }
-    });
+    // ========== 第一階段：局部窗口搜尋 (優先防漂移) ==========
+    // 在當前進度附近（前 15 字 ~ 後 90 字）尋找匹配，確保正常連續朗讀時平穩鎖定
+    const localStart = Math.max(0, currentCharPos - 15);
+    const localEnd = Math.min(fullCleanedText.length, currentCharPos + 90);
+    const localSlice = fullCleanedText.slice(localStart, localEnd);
 
-    if (!candidateChars) return;
-
-    // 從最新講到的字串末端取 2~6 個字作為搜尋錨點
-    const queryLen = Math.min(cleanedTranscript.length, 6);
+    const queryLen = Math.min(cleanedTranscript.length, 8);
     const querySuffix = cleanedTranscript.slice(-queryLen);
 
-    let matchPos = -1;
-
-    // 優先匹配最後幾個字
+    // 1. 局部末端比對（長度從 queryLen 遞減到 2）
     for (let len = queryLen; len >= 2; len--) {
       const sub = querySuffix.slice(-len);
-      const found = candidateChars.indexOf(sub);
+      const found = localSlice.indexOf(sub);
       if (found !== -1) {
-        matchPos = found + len - 1;
+        matchCharIndex = localStart + found + len - 1;
         break;
       }
     }
 
-    // 若末端沒對到，再嘗試用整段對齊
-    if (matchPos === -1 && cleanedTranscript.length >= 3) {
-      for (let len = Math.min(cleanedTranscript.length, 5); len >= 2; len--) {
+    // 2. 局部整句比對
+    if (matchCharIndex === -1 && cleanedTranscript.length >= 3) {
+      for (let len = Math.min(cleanedTranscript.length, 6); len >= 2; len--) {
         const sub = cleanedTranscript.slice(-len);
-        const found = candidateChars.lastIndexOf(sub);
+        const found = localSlice.lastIndexOf(sub);
         if (found !== -1) {
-          matchPos = found + len - 1;
+          matchCharIndex = localStart + found + len - 1;
           break;
         }
       }
     }
 
-    if (matchPos !== -1 && matchPos < tokenIndexMap.length) {
-      const targetTokenIdx = tokenIndexMap[matchPos];
-      if (targetTokenIdx >= currentTokenIndex.value) {
+    // ========== 第二階段：遠程跨段落搜尋 (支援跳一段、跳兩段或跳大章節) ==========
+    // 當局部窗口完全無法吻合時，代表講者跳過內容或念了遠處段落
+    if (matchCharIndex === -1 && cleanedTranscript.length >= 3) {
+      const anchorMaxLen = Math.min(cleanedTranscript.length, 12);
+      const anchorSuffix = cleanedTranscript.slice(-anchorMaxLen);
+
+      // (A) 優先搜尋前方遠處段落（從當前位置 + 30 之後往後找）
+      const forwardStart = Math.min(fullCleanedText.length, currentCharPos + 30);
+      const forwardText = fullCleanedText.slice(forwardStart);
+
+      // 優先用末端 3~12 個字元比對後續段落
+      for (let len = anchorMaxLen; len >= 3; len--) {
+        const sub = anchorSuffix.slice(-len);
+        const found = forwardText.indexOf(sub);
+        if (found !== -1) {
+          matchCharIndex = forwardStart + found + len - 1;
+          break;
+        }
+      }
+
+      // (B) 若末端沒對到，用最新整句或開頭 4~10 個字元在後續段落尋找
+      if (matchCharIndex === -1 && cleanedTranscript.length >= 4) {
+        for (let len = Math.min(cleanedTranscript.length, 10); len >= 4; len--) {
+          const sub = cleanedTranscript.slice(0, len);
+          const found = forwardText.indexOf(sub);
+          if (found !== -1) {
+            matchCharIndex = forwardStart + found + len - 1;
+            break;
+          }
+        }
+      }
+
+      // (C) 全文範圍廣域比對（支援大跨度跳轉或跳回前文）
+      if (matchCharIndex === -1 && anchorMaxLen >= 4) {
+        for (let len = anchorMaxLen; len >= 4; len--) {
+          const sub = anchorSuffix.slice(-len);
+          const found = fullCleanedText.indexOf(sub);
+          if (found !== -1) {
+            matchCharIndex = found + len - 1;
+            break;
+          }
+        }
+      }
+    }
+
+    // ========== 更新朗讀 Token 位置 ==========
+    if (matchCharIndex >= 0 && matchCharIndex < fullTokenMap.length) {
+      const targetTokenIdx = fullTokenMap[matchCharIndex];
+      if (targetTokenIdx !== undefined && targetTokenIdx !== currentTokenIndex.value) {
         currentTokenIndex.value = targetTokenIdx;
       }
     }
