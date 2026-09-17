@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import type { ScriptItem, PrompterSettings } from '../db';
-import { useSpeechPrompter } from '../composables/useSpeechPrompter';
+import { useSpeechPrompter, detectLanguage } from '../composables/useSpeechPrompter';
 import { 
   Play,
   Pause,
@@ -11,16 +11,9 @@ import {
   X, 
   Maximize2, 
   Minimize2, 
-  FlipHorizontal, 
-  FlipVertical, 
-  Eye, 
   Sliders, 
   HelpCircle,
-  Volume2,
-  Gauge,
-  Plus,
-  Minus,
-  Hand
+  Gauge
 } from 'lucide-vue-next';
 
 const props = defineProps<{
@@ -38,7 +31,10 @@ const settings = ref<PrompterSettings>({
   ...props.initialSettings,
   enableAutoScroll: props.initialSettings.enableAutoScroll ?? true,
   enableVoice: props.initialSettings.enableVoice ?? true,
-  scrollSpeed: props.initialSettings.scrollSpeed || 3
+  scrollSpeed: props.initialSettings.scrollSpeed || 3,
+  showGuideLine: false,
+  mirrorH: false,
+  mirrorV: false
 });
 
 // 語音提詞引擎
@@ -46,10 +42,7 @@ const {
   isSupported,
   isListening,
   speechLang,
-  interimText,
-  lastRecognizedText,
   errorMessage,
-  micVolume,
   tokens,
   currentTokenIndex,
   progressPercent,
@@ -65,6 +58,43 @@ const showControls = ref(true);
 const showHelpModal = ref(false);
 const isFullscreen = ref(false);
 
+// 觸控滑動檢測（避免滑動捲動時誤觸發隱藏/顯示工具列）
+let touchStartX = 0;
+let touchStartY = 0;
+let isTouchScroll = false;
+
+function handleTouchStart(e: TouchEvent) {
+  if (e.touches.length === 1) {
+    touchStartX = e.touches[0].clientX;
+    touchStartY = e.touches[0].clientY;
+    isTouchScroll = false;
+  }
+}
+
+function handleTouchMove(e: TouchEvent) {
+  if (e.touches.length === 1) {
+    const dx = Math.abs(e.touches[0].clientX - touchStartX);
+    const dy = Math.abs(e.touches[0].clientY - touchStartY);
+    if (dx > 10 || dy > 10) {
+      isTouchScroll = true;
+    }
+  }
+}
+
+// 點擊畫面任意處切換工具列顯示/隱藏
+function handleScreenClick(e: MouseEvent) {
+  if (isTouchScroll) {
+    isTouchScroll = false;
+    return;
+  }
+  const target = e.target as HTMLElement;
+  // 若點擊在按鈕、滑桿、選單或彈窗內，不切換
+  if (target.closest('button, input, select, textarea, .floating-controls, .prompter-top-bar, .modal-card')) {
+    return;
+  }
+  showControls.value = !showControls.value;
+}
+
 // 自動滾動執行狀態與浮點數累計器（防止瀏覽器 DOM scrollTop 整數截斷導致低速 1, 2, 3 無法滾動）
 const isAutoScrolling = ref(settings.value.enableAutoScroll);
 let scrollAccumulator = 0;
@@ -73,14 +103,13 @@ let lastScrollTimestamp = 0;
 
 const scrollContainerRef = ref<HTMLElement | null>(null);
 
-// 自動滾動動畫循環 (以 JS 浮點數累進，徹底解決速度 1, 2, 3 次像素被截斷問題)
+// 自動滾動動畫循環
 function runAutoScrollLoop(timestamp: number) {
   if (!lastScrollTimestamp) lastScrollTimestamp = timestamp;
   const deltaSeconds = Math.min((timestamp - lastScrollTimestamp) / 1000, 0.1);
   lastScrollTimestamp = timestamp;
 
   if (settings.value.enableAutoScroll && isAutoScrolling.value && scrollContainerRef.value) {
-    // 速度係數：速度 1 = 20px/s，速度 2 = 36px/s，速度 3 = 52px/s，速度 10 = 164px/s
     const speedPxPerSec = 4 + settings.value.scrollSpeed * 16;
     scrollAccumulator += speedPxPerSec * deltaSeconds;
     scrollContainerRef.value.scrollTop = scrollAccumulator;
@@ -136,12 +165,9 @@ function setSpeed(spd: number) {
 
 // 空白鍵一鍵控制播放/暫停
 function handleSpaceToggle() {
-  // 若有開啟自動滾動，優先切換自動滾動的暫停/播放
   if (settings.value.enableAutoScroll) {
     isAutoScrolling.value = !isAutoScrolling.value;
-  }
-  // 若只有語音辨識開啟，則切換收音暫停/開始
-  else if (settings.value.enableVoice) {
+  } else if (settings.value.enableVoice) {
     if (isListening.value) {
       stopListening();
     } else {
@@ -152,7 +178,10 @@ function handleSpaceToggle() {
 
 // 初始化解析文稿並啟動
 onMounted(() => {
-  speechLang.value = settings.value.speechLang;
+  // 自動偵測文稿語系
+  const autoLang = detectLanguage(props.script.content);
+  speechLang.value = autoLang;
+  settings.value.speechLang = autoLang;
   parseScriptToTokens(props.script.content);
 
   // 依獨立開關個別啟動
@@ -211,16 +240,6 @@ watch(currentTokenIndex, (newIdx) => {
 watch(settings, (newVal) => {
   emit('update-settings', { ...newVal });
 }, { deep: true });
-
-function handleLanguageChange(e: Event) {
-  const select = e.target as HTMLSelectElement;
-  settings.value.speechLang = select.value;
-  speechLang.value = select.value;
-  if (isListening.value && settings.value.enableVoice) {
-    stopListening();
-    startListening();
-  }
-}
 
 // 全螢幕切換
 async function toggleFullscreen() {
@@ -291,11 +310,6 @@ function handleKeyDown(e: KeyboardEvent) {
     e.preventDefault();
     toggleFullscreen();
   }
-  // 'M' 鍵：水平鏡像
-  else if (e.key.toLowerCase() === 'm' && !e.metaKey && !e.ctrlKey) {
-    e.preventDefault();
-    settings.value.mirrorH = !settings.value.mirrorH;
-  }
   // 'H' 鍵：說明彈窗
   else if (e.key.toLowerCase() === 'h' && !e.metaKey && !e.ctrlKey) {
     e.preventDefault();
@@ -315,7 +329,7 @@ function handleReset() {
 <template>
   <div class="prompter-mode">
     <!-- 頂部沉浸式資訊條 -->
-    <div class="prompter-top-bar">
+    <div class="prompter-top-bar" @click.stop>
       <div class="top-left">
         <button class="btn-top-exit" @click="emit('exit')" title="結束提詞 (ESC)">
           <X :size="18" />
@@ -325,67 +339,6 @@ function handleReset() {
         <div class="script-headline">
           <span class="script-title">{{ script.title }}</span>
           <span v-if="settings.enableVoice" class="progress-label">{{ progressPercent }}% 完成</span>
-        </div>
-      </div>
-
-      <!-- 中央控制：獨立雙開關狀態 -->
-      <div class="top-center">
-        <!-- 開關一：自動滾動獨立開關與速度調整 -->
-        <div class="feature-toggle-cluster">
-          <button 
-            class="feature-toggle-btn"
-            :class="{ active: settings.enableAutoScroll }"
-            @click="toggleAutoScroll"
-            :title="settings.enableAutoScroll ? '關閉自動滾動 (快捷鍵 A)' : '開啟自動滾動 (快捷鍵 A)'"
-          >
-            <Gauge :size="14" />
-            <span>自動滾動: {{ settings.enableAutoScroll ? (isAutoScrolling ? '滾動中' : '已暫停') : '關閉' }}</span>
-          </button>
-
-          <!-- 自動滾動開啟時的速度快速調節 -->
-          <div v-if="settings.enableAutoScroll" class="speed-mini-ctrl">
-            <button class="btn-speed-step" @click="adjustSpeed(-0.5)" title="減速 ([ 或 ←)">
-              <Minus :size="12" />
-            </button>
-            <span class="speed-readout">{{ settings.scrollSpeed }}x</span>
-            <button class="btn-speed-step" @click="adjustSpeed(0.5)" title="加速 (] 或 →)">
-              <Plus :size="12" />
-            </button>
-          </div>
-        </div>
-
-        <!-- 開關二：語音辨識獨立開關與即時反饋 -->
-        <div class="feature-toggle-cluster">
-          <button 
-            class="feature-toggle-btn voice-btn"
-            :class="{ active: settings.enableVoice && isListening, inactive: !settings.enableVoice }"
-            @click="toggleVoice"
-            :title="settings.enableVoice ? '關閉語音辨識 (快捷鍵 V)' : '開啟語音辨識 (快捷鍵 V)'"
-          >
-            <div class="mic-indicator-dot">
-              <span v-if="settings.enableVoice && isListening" class="pulse-ring-dot"></span>
-              <Mic v-if="settings.enableVoice" :size="14" />
-              <MicOff v-else :size="14" />
-            </div>
-            <span>語音辨識: {{ settings.enableVoice ? (isListening ? '收音中' : '暫停') : '關閉' }}</span>
-
-            <!-- 收音即時音量小條 -->
-            <div v-if="settings.enableVoice && isListening" class="vol-meter" :title="`收音音量: ${micVolume}%`">
-              <div class="vol-bar" :style="{ width: `${micVolume}%` }"></div>
-            </div>
-          </button>
-
-          <!-- 即時語音文字反饋 -->
-          <div v-if="settings.enableVoice && (interimText || lastRecognizedText)" class="recognized-pill">
-            <Volume2 :size="13" class="rec-icon" />
-            <span class="rec-text">{{ interimText || lastRecognizedText }}</span>
-          </div>
-        </div>
-
-        <!-- 當兩者皆關閉時提示純手動滑動模式 -->
-        <div v-if="!settings.enableAutoScroll && !settings.enableVoice" class="manual-notice-badge">
-          <Hand :size="14" />
-          <span>純手動滑動模式（滑鼠滾輪/觸控/方向鍵）</span>
         </div>
       </div>
 
@@ -401,7 +354,7 @@ function handleReset() {
           class="btn-icon-top" 
           :class="{ active: showControls }" 
           @click="showControls = !showControls"
-          title="切換控制面板"
+          title="切換工具列 (輕觸畫面任意處亦可隱藏/顯示)"
         >
           <Sliders :size="18" />
         </button>
@@ -429,11 +382,14 @@ function handleReset() {
       <div class="guide-pointer right">◀</div>
     </div>
 
-    <!-- 文字滾動閱讀主區 -->
+    <!-- 文字滾動閱讀主區（點擊畫面切換隱藏/顯示工具列） -->
     <main 
       ref="scrollContainerRef" 
       class="prompter-scroll-viewport"
       @scroll="handleContainerScroll"
+      @click="handleScreenClick"
+      @touchstart="handleTouchStart"
+      @touchmove="handleTouchMove"
     >
       <div 
         class="prompter-text-container"
@@ -456,7 +412,7 @@ function handleReset() {
           <!-- 換行 -->
           <br v-if="token.isNewline" />
 
-          <!-- 可點擊字符/單詞 -->
+          <!-- 可點擊字符/單詞（雙擊可跳轉進度） -->
           <span
             v-else
             :id="`token-${token.id}`"
@@ -467,8 +423,8 @@ function handleReset() {
               'token-unread': !settings.enableVoice || token.id > currentTokenIndex || currentTokenIndex < 0,
               'token-punct': token.isPunctuationOrSpace
             }"
-            @click="jumpToTokenIndex(token.id)"
-            :title="`點擊跳轉至此處`"
+            @dblclick.stop="jumpToTokenIndex(token.id)"
+            title="雙擊跳轉至此處 / 點擊畫面切換工具列"
           >{{ token.text }}</span>
         </template>
 
@@ -477,12 +433,17 @@ function handleReset() {
       </div>
     </main>
 
+    <!-- 工具列隱藏時的提示條 -->
+    <div v-if="!showControls" class="tap-hint-pill">
+      <span>輕觸畫面顯示工具列</span>
+    </div>
+
     <!-- 懸浮專業控制面板 (可收合) -->
     <transition name="slide-up">
-      <div v-if="showControls" class="floating-controls glass-panel">
+      <div v-if="showControls" class="floating-controls glass-panel" @click.stop>
         <div class="controls-grid">
           <!-- 獨立開關區 -->
-          <div class="ctrl-group">
+          <div class="ctrl-group main-actions">
             <!-- 自動滾動獨立開關按鈕 -->
             <button 
               class="btn"
@@ -514,125 +475,76 @@ function handleReset() {
             </button>
           </div>
 
-          <div class="ctrl-divider"></div>
+          <div class="ctrl-divider desktop-only"></div>
 
-          <!-- 自動滾動速度調整 (自動滾動開啟時可調) -->
-          <div class="ctrl-slider-item speed-slider" :class="{ disabled: !settings.enableAutoScroll }">
-            <div class="slider-header">
-              <span>滾動速度</span>
-              <span class="slider-val">{{ settings.scrollSpeed }}x</span>
+          <!-- 滑桿群組 -->
+          <div class="ctrl-sliders-row">
+            <!-- 自動滾動速度調整 (自動滾動開啟時可調) -->
+            <div class="ctrl-slider-item speed-slider" :class="{ disabled: !settings.enableAutoScroll }">
+              <div class="slider-header">
+                <span>滾動速度</span>
+                <span class="slider-val">{{ settings.scrollSpeed }}x</span>
+              </div>
+              <input 
+                v-model.number="settings.scrollSpeed" 
+                type="range" 
+                min="1" 
+                max="10" 
+                step="0.5" 
+                :disabled="!settings.enableAutoScroll"
+              />
+              <div class="speed-presets">
+                <button class="preset-tag" :class="{ active: settings.scrollSpeed === 1.5 }" @click="setSpeed(1.5)" :disabled="!settings.enableAutoScroll">慢</button>
+                <button class="preset-tag" :class="{ active: settings.scrollSpeed === 3 }" @click="setSpeed(3)" :disabled="!settings.enableAutoScroll">標</button>
+                <button class="preset-tag" :class="{ active: settings.scrollSpeed === 5 }" @click="setSpeed(5)" :disabled="!settings.enableAutoScroll">快</button>
+                <button class="preset-tag" :class="{ active: settings.scrollSpeed === 8 }" @click="setSpeed(8)" :disabled="!settings.enableAutoScroll">特快</button>
+              </div>
             </div>
-            <input 
-              v-model.number="settings.scrollSpeed" 
-              type="range" 
-              min="1" 
-              max="10" 
-              step="0.5" 
-              :disabled="!settings.enableAutoScroll"
-            />
-            <div class="speed-presets">
-              <button class="preset-tag" :class="{ active: settings.scrollSpeed === 1.5 }" @click="setSpeed(1.5)" :disabled="!settings.enableAutoScroll">慢</button>
-              <button class="preset-tag" :class="{ active: settings.scrollSpeed === 3 }" @click="setSpeed(3)" :disabled="!settings.enableAutoScroll">標</button>
-              <button class="preset-tag" :class="{ active: settings.scrollSpeed === 5 }" @click="setSpeed(5)" :disabled="!settings.enableAutoScroll">快</button>
-              <button class="preset-tag" :class="{ active: settings.scrollSpeed === 8 }" @click="setSpeed(8)" :disabled="!settings.enableAutoScroll">特快</button>
+
+            <!-- 字級調整 -->
+            <div class="ctrl-slider-item">
+              <div class="slider-header">
+                <span>字體大小</span>
+                <span class="slider-val">{{ settings.fontSize }}px</span>
+              </div>
+              <input 
+                v-model.number="settings.fontSize" 
+                type="range" 
+                min="24" 
+                max="96" 
+                step="2" 
+              />
             </div>
-          </div>
 
-          <!-- 語音語言切換 -->
-          <div class="ctrl-group" :class="{ disabled: !settings.enableVoice }">
-            <select 
-              :value="settings.speechLang" 
-              class="lang-select" 
-              @change="handleLanguageChange"
-              :disabled="!settings.enableVoice"
-              title="語音辨識語言"
-            >
-              <option value="zh-TW">繁體中文 (TW)</option>
-              <option value="en-US">English (US)</option>
-              <option value="zh-CN">普通话 (CN)</option>
-            </select>
-          </div>
-
-          <div class="ctrl-divider"></div>
-
-          <!-- 字級調整 -->
-          <div class="ctrl-slider-item">
-            <div class="slider-header">
-              <span>字體大小</span>
-              <span class="slider-val">{{ settings.fontSize }}px</span>
+            <!-- 行距調整 -->
+            <div class="ctrl-slider-item">
+              <div class="slider-header">
+                <span>行距倍率</span>
+                <span class="slider-val">{{ settings.lineHeight }}x</span>
+              </div>
+              <input 
+                v-model.number="settings.lineHeight" 
+                type="range" 
+                min="1.4" 
+                max="2.6" 
+                step="0.1" 
+              />
             </div>
-            <input 
-              v-model.number="settings.fontSize" 
-              type="range" 
-              min="24" 
-              max="96" 
-              step="2" 
-            />
-          </div>
 
-          <!-- 行距調整 -->
-          <div class="ctrl-slider-item">
-            <div class="slider-header">
-              <span>行距倍率</span>
-              <span class="slider-val">{{ settings.lineHeight }}x</span>
+            <!-- 欄寬調整（集中視線） -->
+            <div class="ctrl-slider-item width-slider desktop-only">
+              <div class="slider-header">
+                <span>閱讀寬度</span>
+                <span class="slider-val">{{ settings.containerWidth }}px</span>
+              </div>
+              <input 
+                v-model.number="settings.containerWidth" 
+                type="range" 
+                min="400" 
+                max="1200" 
+                step="20" 
+              />
             </div>
-            <input 
-              v-model.number="settings.lineHeight" 
-              type="range" 
-              min="1.4" 
-              max="2.6" 
-              step="0.1" 
-            />
-          </div>
-
-          <!-- 欄寬調整（集中視線） -->
-          <div class="ctrl-slider-item">
-            <div class="slider-header">
-              <span>閱讀寬度</span>
-              <span class="slider-val">{{ settings.containerWidth }}px</span>
-            </div>
-            <input 
-              v-model.number="settings.containerWidth" 
-              type="range" 
-              min="400" 
-              max="1200" 
-              step="20" 
-            />
-          </div>
-
-          <div class="ctrl-divider"></div>
-
-          <!-- 開關按鈕群 -->
-          <div class="ctrl-toggles">
-            <!-- 水平鏡像 -->
-            <button 
-              class="btn-icon" 
-              :class="{ active: settings.mirrorH }" 
-              @click="settings.mirrorH = !settings.mirrorH"
-              title="水平鏡像翻轉（相容實體提詞機分光鏡）"
-            >
-              <FlipHorizontal :size="16" />
-            </button>
-
-            <!-- 垂直鏡像 -->
-            <button 
-              class="btn-icon" 
-              :class="{ active: settings.mirrorV }" 
-              @click="settings.mirrorV = !settings.mirrorV"
-              title="垂直鏡像翻轉"
-            >
-              <FlipVertical :size="16" />
-            </button>
-
-            <!-- 視覺輔助線開關 -->
-            <button 
-              class="btn-icon" 
-              :class="{ active: settings.showGuideLine }" 
-              @click="settings.showGuideLine = !settings.showGuideLine"
-              title="焦點引導水平線開關"
-            >
-              <Eye :size="16" />
-            </button>
           </div>
         </div>
       </div>
@@ -669,10 +581,6 @@ function handleReset() {
           <div class="shortcut-item">
             <kbd>F</kbd>
             <span>切換全螢幕模式</span>
-          </div>
-          <div class="shortcut-item">
-            <kbd>M</kbd>
-            <span>切換水平鏡像翻轉（分光鏡用）</span>
           </div>
           <div class="shortcut-item">
             <kbd>ESC</kbd>
@@ -740,13 +648,14 @@ function handleReset() {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  overflow: hidden;
 }
 
 .script-title {
   font-size: 14px;
   font-weight: 700;
   color: var(--text-primary);
-  max-width: 200px;
+  max-width: 220px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -756,147 +665,7 @@ function handleReset() {
   font-size: 11px;
   font-family: var(--font-mono);
   color: var(--accent-primary);
-}
-
-.top-center {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-/* 獨立功能開關群組 */
-.feature-toggle-cluster {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.feature-toggle-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text-muted);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-.feature-toggle-btn.active {
-  background: rgba(245, 158, 11, 0.18);
-  border-color: rgba(245, 158, 11, 0.5);
-  color: #FBBF24;
-}
-
-.feature-toggle-btn.voice-btn.active {
-  background: rgba(6, 182, 212, 0.18);
-  border-color: rgba(6, 182, 212, 0.5);
-  color: #22D3EE;
-}
-
-.speed-mini-ctrl {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-full);
-  padding: 2px 6px;
-}
-
-.btn-speed-step {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(255, 255, 255, 0.1);
-  border: none;
-  color: var(--text-primary);
-  cursor: pointer;
-}
-
-.btn-speed-step:hover {
-  background: rgba(255, 255, 255, 0.25);
-}
-
-.speed-readout {
-  font-size: 11px;
-  font-family: var(--font-mono);
-  font-weight: 700;
-  color: var(--accent-primary);
-  min-width: 30px;
-  text-align: center;
-}
-
-.mic-indicator-dot {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.pulse-ring-dot {
-  position: absolute;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: rgba(6, 182, 212, 0.4);
-  animation: micPulse 1.4s infinite ease-out;
-}
-
-/* 音量條 */
-.vol-meter {
-  width: 28px;
-  height: 4px;
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-left: 4px;
-}
-
-.vol-bar {
-  height: 100%;
-  background: var(--accent-cyan);
-  transition: width 0.05s ease-out;
-}
-
-/* 即時文字反饋 */
-.recognized-pill {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: var(--radius-full);
-  background: rgba(6, 182, 212, 0.1);
-  border: 1px solid rgba(6, 182, 212, 0.25);
-  color: #22D3EE;
-  font-size: 11px;
-  max-width: 200px;
-}
-
-.rec-text {
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* 純手動提示徽章 */
-.manual-notice-badge {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 12px;
-  border-radius: var(--radius-full);
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px dashed var(--border-subtle);
-  color: var(--text-secondary);
-  font-size: 12px;
 }
 
 .btn-cyan {
@@ -917,6 +686,7 @@ function handleReset() {
   color: var(--text-secondary);
   cursor: pointer;
   transition: all var(--transition-fast);
+  flex-shrink: 0;
 }
 
 .btn-icon-top:hover, .btn-icon-top.active {
@@ -981,9 +751,10 @@ function handleReset() {
   overflow-x: hidden;
   display: flex;
   justify-content: center;
-  padding: 0 24px;
+  padding: 0 20px;
   position: relative;
   scrollbar-width: none;
+  cursor: pointer;
 }
 
 .prompter-scroll-viewport::-webkit-scrollbar {
@@ -998,6 +769,8 @@ function handleReset() {
   letter-spacing: 1px;
   user-select: none;
   position: relative;
+  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 .scroll-padding-top {
@@ -1011,7 +784,6 @@ function handleReset() {
 /* 字符狀態 */
 .token {
   display: inline;
-  cursor: pointer;
   padding: 1px 2px;
   border-radius: 4px;
   transition: color 0.15s ease, background-color 0.15s ease;
@@ -1025,15 +797,45 @@ function handleReset() {
   cursor: default;
 }
 
+/* 工具列隱藏提示 */
+.tap-hint-pill {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 7px 16px;
+  border-radius: var(--radius-full);
+  background: rgba(15, 23, 42, 0.75);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--text-secondary);
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  pointer-events: none;
+  z-index: 40;
+  animation: fadeInOut 3s forwards;
+  white-space: nowrap;
+}
+
+@keyframes fadeInOut {
+  0% { opacity: 0; transform: translate(-50%, 10px); }
+  15% { opacity: 1; transform: translate(-50%, 0); }
+  80% { opacity: 1; transform: translate(-50%, 0); }
+  100% { opacity: 0; transform: translate(-50%, 0); }
+}
+
 /* 懸浮控制面板 */
 .floating-controls {
   position: absolute;
   bottom: 24px;
   left: 50%;
   transform: translateX(-50%);
-  padding: 14px 22px;
+  padding: 14px 20px;
   z-index: 60;
   max-width: 95vw;
+  box-sizing: border-box;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+  cursor: default;
 }
 
 .controls-grid {
@@ -1042,10 +844,11 @@ function handleReset() {
   gap: 16px;
 }
 
-.ctrl-group {
+.ctrl-group.main-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .ctrl-group.disabled, .ctrl-slider-item.disabled {
@@ -1057,6 +860,13 @@ function handleReset() {
   width: 1px;
   height: 32px;
   background: var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.ctrl-sliders-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 
 .ctrl-slider-item {
@@ -1067,7 +877,7 @@ function handleReset() {
 }
 
 .ctrl-slider-item.speed-slider {
-  width: 130px;
+  width: 140px;
 }
 
 .speed-presets {
@@ -1085,12 +895,14 @@ function handleReset() {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-secondary);
   cursor: pointer;
+  text-align: center;
 }
 
 .preset-tag:hover, .preset-tag.active {
   background: var(--accent-primary);
   color: #000;
   border-color: var(--accent-primary);
+  font-weight: 700;
 }
 
 .slider-header {
@@ -1104,23 +916,6 @@ function handleReset() {
   color: var(--accent-primary);
   font-family: var(--font-mono);
   font-weight: 700;
-}
-
-.ctrl-toggles {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.lang-select {
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  padding: 6px 10px;
-  font-size: 12px;
-  color: var(--text-primary);
-  cursor: pointer;
-  outline: none;
 }
 
 /* 快捷鍵彈窗 */
@@ -1175,7 +970,7 @@ kbd {
 
 /* 轉場動畫 */
 .slide-up-enter-active, .slide-up-leave-active {
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .slide-up-enter-from, .slide-up-leave-to {
@@ -1183,24 +978,105 @@ kbd {
   opacity: 0;
 }
 
-@media (max-width: 900px) {
+/* 手機與平板適應性排版（解決跑版問題） */
+@media (max-width: 768px) {
+  .prompter-top-bar {
+    padding: 8px 12px;
+  }
+
+  .script-title {
+    max-width: 130px;
+    font-size: 13px;
+  }
+
+  .btn-top-exit {
+    padding: 5px 8px;
+    font-size: 12px;
+    gap: 4px;
+  }
+
+  .btn-icon-top {
+    width: 32px;
+    height: 32px;
+  }
+
   .floating-controls {
     bottom: 12px;
-    padding: 10px 14px;
+    width: calc(100% - 20px);
+    max-width: 440px;
+    padding: 12px;
+    border-radius: var(--radius-lg);
   }
+
   .controls-grid {
-    flex-wrap: wrap;
-    justify-content: center;
+    flex-direction: column;
     gap: 10px;
+    width: 100%;
   }
+
+  .ctrl-group.main-actions {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    width: 100%;
+  }
+
+  .ctrl-group.main-actions .btn {
+    padding: 8px 4px;
+    font-size: 11px;
+    justify-content: center;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ctrl-group.main-actions .btn span {
+    font-size: 11px;
+  }
+
+  .desktop-only {
+    display: none !important;
+  }
+
+  .ctrl-sliders-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    width: 100%;
+  }
+
   .ctrl-slider-item {
-    width: 80px;
+    width: 100%;
   }
+
+  .ctrl-slider-item.speed-slider {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .prompter-top-bar {
+    padding: 6px 10px;
+  }
+
   .script-title {
-    max-width: 120px;
+    max-width: 90px;
+    font-size: 12px;
   }
-  .recognized-pill {
-    display: none;
+
+  .top-left, .top-right {
+    gap: 6px;
+  }
+
+  .ctrl-group.main-actions .btn {
+    font-size: 10px;
+    padding: 7px 2px;
+  }
+
+  .ctrl-group.main-actions .btn span {
+    font-size: 10px;
   }
 }
 </style>

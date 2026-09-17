@@ -49,6 +49,51 @@ declare global {
   }
 }
 
+// 自動判斷語言演算法
+export function detectLanguage(content: string): string {
+  if (!content || !content.trim()) {
+    if (typeof navigator !== 'undefined' && navigator.language) {
+      if (navigator.language.startsWith('zh-CN') || navigator.language.startsWith('zh-SG')) return 'zh-CN';
+      if (navigator.language.startsWith('en')) return 'en-US';
+      return 'zh-TW';
+    }
+    return 'zh-TW';
+  }
+
+  // 計算英文字母數量
+  const latinMatches = content.match(/[a-zA-Z]/g);
+  const latinCount = latinMatches ? latinMatches.length : 0;
+
+  // 計算中文字元數量
+  const cjkMatches = content.match(/[\u4e00-\u9fa5]/g);
+  const cjkCount = cjkMatches ? cjkMatches.length : 0;
+
+  // 若英文字元顯著多於中文字元，或有一定英文且無中文，則判定為英文
+  if (latinCount > cjkCount * 1.2 || (latinCount > 10 && cjkCount === 0)) {
+    return 'en-US';
+  }
+
+  // 若以中文為主
+  if (cjkCount > 0) {
+    // 簡體特徵字元比對
+    const simpRegex = /[们这为来时说发对经国学实开样么见应关现将头进长机边过车门体变听让带总认给华济选导计东农电页]/g;
+    // 繁體特徵字元比對
+    const tradRegex = /[們這為來時說發對經國學實開樣麼見應關現將頭進長機邊過車門體變聽讓帶總認給華濟選導計東農電頁臺點]/g;
+
+    const simpMatches = content.match(simpRegex);
+    const tradMatches = content.match(tradRegex);
+    const simpCount = simpMatches ? simpMatches.length : 0;
+    const tradCount = tradMatches ? tradMatches.length : 0;
+
+    if (simpCount > tradCount) {
+      return 'zh-CN';
+    }
+    return 'zh-TW';
+  }
+
+  return 'zh-TW';
+}
+
 export function useSpeechPrompter() {
   const isSupported = ref<boolean>(
     typeof window !== 'undefined' &&
@@ -78,6 +123,9 @@ export function useSpeechPrompter() {
 
   // 將原始文稿解析為結構化 Token 清單
   function parseScriptToTokens(content: string) {
+    // 自動判斷並套用辨識語言
+    speechLang.value = detectLanguage(content);
+
     const list: PrompterToken[] = [];
     let id = 0;
 
