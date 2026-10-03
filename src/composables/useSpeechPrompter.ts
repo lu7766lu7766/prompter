@@ -296,10 +296,10 @@ export function useSpeechPrompter() {
     // ---- 環境音閘門（現場雜音時不推進） ----
     // 太短的 interim 碎片多半是雜音
     if (!isFinal && cleanedTranscript.length < 2) return;
-    // 音量低 + 文本短：視為環境音
+    // 音量低 + 文本短：視為環境音（有音量時 interim 全放行，即時跟隨）
     if (volume < noiseGateThreshold.value && cleanedTranscript.length < 6) return;
-    // 瀏覽器明確回報低信心（0 視為未知，不擋）
-    if (!isFinal && confidence > 0 && confidence < 0.35) return;
+    // 註：interim 不做信心過濾（Chrome interim 常帶低信心值，擋掉會變成斷句才跳；
+    // 200 字窗 + 最近匹配本身已具自我修正能力，遠跳則只允許 final）
 
     // 取得當前朗讀進度在全文中的字元索引
     const currentIdx = currentTokenIndex.value;

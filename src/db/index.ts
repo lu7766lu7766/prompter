@@ -47,7 +47,7 @@ export const DEFAULT_SETTINGS: PrompterSettings = {
   id: 'global',
   enableAutoScroll: true,
   enableVoice: true,
-  scrollSpeed: 3,
+  scrollSpeed: 1.5,
   fontSize: 48,
   lineHeight: 1.8,
   containerWidth: 840,

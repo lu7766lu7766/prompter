@@ -33,6 +33,11 @@ async function loadData() {
 
     const savedSettings = await db.settings.get('global');
     if (savedSettings) {
+      // 舊版預設速度 3（標）→ 新版預設 1.5（慢）：僅轉移仍為舊預設者
+      if (savedSettings.scrollSpeed === 3) {
+        savedSettings.scrollSpeed = 1.5;
+        await db.settings.put(savedSettings);
+      }
       settings.value = savedSettings;
     }
   } catch (err) {

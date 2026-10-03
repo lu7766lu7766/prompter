@@ -7,7 +7,6 @@ import {
   Pause,
   Mic, 
   MicOff, 
-  RotateCcw, 
   X, 
   Maximize2, 
   Minimize2, 
@@ -31,7 +30,7 @@ const settings = ref<PrompterSettings>({
   ...props.initialSettings,
   enableAutoScroll: props.initialSettings.enableAutoScroll ?? true,
   enableVoice: props.initialSettings.enableVoice ?? true,
-  scrollSpeed: props.initialSettings.scrollSpeed || 3,
+  scrollSpeed: props.initialSettings.scrollSpeed ?? 1.5,
   micGate: props.initialSettings.micGate ?? 10,
   showGuideLine: true,
   mirrorH: false,
@@ -43,6 +42,7 @@ const {
   isSupported,
   isListening,
   isReconnecting,
+  interimText,
   lastResultAt,
   statusTick,
   speechLang,
@@ -56,14 +56,36 @@ const {
   parseScriptToTokens,
   startListening,
   stopListening,
-  jumpToTokenIndex,
-  resetProgress
+  jumpToTokenIndex
 } = useSpeechPrompter();
 
 // 控制面板顯示狀態
 const showControls = ref(true);
 const showHelpModal = ref(false);
 const isFullscreen = ref(false);
+
+// 閒置自動隱藏：手指離開螢幕 3 秒後淡出，觸碰即出現
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+let autoShownAt = 0;
+const IDLE_HIDE_MS = 3000;
+
+function pokeIdle() {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  idleTimer = setTimeout(() => {
+    showControls.value = false;
+  }, IDLE_HIDE_MS);
+}
+
+function onUserActive() {
+  if (!showControls.value) {
+    showControls.value = true;
+    autoShownAt = Date.now();
+  }
+  pokeIdle();
+}
 
 // 觸控滑動檢測（避免滑動捲動時誤觸發隱藏/顯示工具列）
 let touchStartX = 0;
@@ -94,6 +116,8 @@ function handleScreenClick(e: MouseEvent) {
     isTouchScroll = false;
     return;
   }
+  // 剛被閒置喚醒時的這次點擊只負責顯示，不再反轉
+  if (Date.now() - autoShownAt < 500) return;
   const target = e.target as HTMLElement;
   // 若點擊在按鈕、滑桿、選單或彈窗內，不切換
   if (target.closest('button, input, select, textarea, .floating-controls, .prompter-top-bar, .modal-card')) {
@@ -233,6 +257,12 @@ onMounted(() => {
   animFrameId = requestAnimationFrame(runAutoScrollLoop);
   window.addEventListener('keydown', handleKeyDown);
   document.addEventListener('fullscreenchange', handleFullscreenChange);
+  // 閒置偵測：觸碰/點按/按鍵都算活動，3 秒無活動自動隱藏工具列
+  window.addEventListener('touchstart', onUserActive, { passive: true });
+  window.addEventListener('touchmove', onUserActive, { passive: true });
+  window.addEventListener('mousedown', onUserActive);
+  window.addEventListener('keydown', onUserActive);
+  pokeIdle();
   setNoiseGate(settings.value.micGate ?? 10);
   noiseGateThreshold.value = settings.value.micGate ?? 10;
 
@@ -249,6 +279,14 @@ onUnmounted(() => {
     cancelAnimationFrame(animFrameId);
     animFrameId = null;
   }
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  window.removeEventListener('touchstart', onUserActive);
+  window.removeEventListener('touchmove', onUserActive);
+  window.removeEventListener('mousedown', onUserActive);
+  window.removeEventListener('keydown', onUserActive);
   window.removeEventListener('keydown', handleKeyDown);
   document.removeEventListener('fullscreenchange', handleFullscreenChange);
 });
@@ -377,14 +415,6 @@ const showStaleWarn = computed(() =>
   secsSinceResult.value > 20
 );
 
-function handleReset() {
-  resetProgress();
-  voiceScrollTarget = null;
-  scrollAccumulator = 0;
-  if (scrollContainerRef.value) {
-    scrollContainerRef.value.scrollTo({ top: 0, behavior: 'smooth' });
-  }
-}
 </script>
 
 <template>
@@ -507,6 +537,11 @@ function handleReset() {
     <!-- 懸浮專業控制面板 (可收合) -->
     <transition name="slide-up">
       <div v-if="showControls" class="floating-controls glass-panel" @click.stop>
+        <!-- 即時辨識文字列（邊講邊顯示，確認有在跟） -->
+        <div v-if="settings.enableVoice" class="live-line">
+          <span class="live-dot" :class="{ on: isListening && !isReconnecting }"></span>
+          <span class="live-text">{{ interimText || (isListening ? '聆聽中…' : '語音已暫停') }}</span>
+        </div>
         <div class="controls-grid">
           <!-- 獨立開關區 -->
           <div class="ctrl-group main-actions">
@@ -535,10 +570,6 @@ function handleReset() {
               <span>語音辨識: {{ settings.enableVoice ? (isReconnecting ? '重連中…' : (isListening ? '收音中' : '暫停')) : '關閉' }}</span>
             </button>
 
-            <button class="btn btn-secondary" @click="handleReset" title="回到文稿最開頭">
-              <RotateCcw :size="16" />
-              <span>重頭開始</span>
-            </button>
           </div>
 
           <div class="ctrl-divider desktop-only"></div>
@@ -562,8 +593,6 @@ function handleReset() {
               <div class="speed-presets">
                 <button class="preset-tag" :class="{ active: settings.scrollSpeed === 1.5 }" @click="setSpeed(1.5)" :disabled="!settings.enableAutoScroll">慢</button>
                 <button class="preset-tag" :class="{ active: settings.scrollSpeed === 3 }" @click="setSpeed(3)" :disabled="!settings.enableAutoScroll">標</button>
-                <button class="preset-tag" :class="{ active: settings.scrollSpeed === 5 }" @click="setSpeed(5)" :disabled="!settings.enableAutoScroll">快</button>
-                <button class="preset-tag" :class="{ active: settings.scrollSpeed === 8 }" @click="setSpeed(8)" :disabled="!settings.enableAutoScroll">特快</button>
               </div>
             </div>
 
@@ -947,7 +976,7 @@ function handleReset() {
   bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
-  padding: 14px 20px;
+  padding: 10px 16px;
   z-index: 60;
   width: min(940px, calc(100vw - 24px));
   max-height: calc(100dvh - 160px);
@@ -963,7 +992,7 @@ function handleReset() {
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
-  gap: 12px 16px;
+  gap: 10px 12px;
 }
 
 .ctrl-group.main-actions {
@@ -1001,8 +1030,8 @@ function handleReset() {
 
 .ctrl-sliders-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
-  gap: 12px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px 12px;
   flex: 2 1 320px;
   min-width: 0;
   width: 100%;
@@ -1020,6 +1049,44 @@ function handleReset() {
 .ctrl-slider-item.speed-slider {
   width: 100%;
   min-width: 0;
+}
+
+/* 即時辨識文字列 */
+.live-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  flex-shrink: 0;
+}
+
+.live-dot.on {
+  background: #22D3EE;
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.9);
+  animation: livePulse 1.2s infinite ease-in-out;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.live-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 收音閘門即時音量條（綠條=目前音量，白線=閘門位置） */
@@ -1176,7 +1243,7 @@ kbd {
   }
 
   .floating-controls {
-    padding: 12px 14px;
+    padding: 10px 12px;
   }
 }
 
@@ -1217,7 +1284,7 @@ kbd {
 
   .ctrl-group.main-actions {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
   }
 
