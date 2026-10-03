@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { db, type ScriptItem, type PrompterSettings, DEFAULT_SETTINGS, SAMPLE_SCRIPT } from './db';
+import { countEffectiveWords, estimateSpeechSeconds } from './utils/textStats';
 import Navbar from './components/Navbar.vue';
 import ScriptList from './components/ScriptList.vue';
 import ScriptEditor from './components/ScriptEditor.vue';
@@ -166,16 +167,16 @@ async function handleImportFile(e: Event) {
           showToast('文稿匯入成功！');
         }
       } else {
-        // 純文字或 Markdown
+        // 純文字或 Markdown（字數去除標點符號）
         const fileNameWithoutExt = file.name.replace(/\.[^/.]+$/, "");
-        const words = text.replace(/\s+/g, '').length;
+        const words = countEffectiveWords(text);
         await db.scripts.add({
           title: fileNameWithoutExt,
           content: text,
           createdAt: Date.now(),
           updatedAt: Date.now(),
           wordCount: words,
-          speechDurationSeconds: Math.round((words / 220) * 60),
+          speechDurationSeconds: estimateSpeechSeconds(words),
           tags: ['匯入']
         });
         showToast(`已成功匯入「${fileNameWithoutExt}」！`);

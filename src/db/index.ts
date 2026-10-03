@@ -24,7 +24,8 @@ export interface PrompterSettings {
   showGuideLine: boolean; // 焦點輔助線
   speechLang: string; // 'zh-TW' | 'en-US' | 'zh-CN'
   highlightColor: string; // 當前朗讀文字發光色
-  speedWpm: number; // 預估語速
+  speedWpm: number; // 預估語速（每分鐘字數，預設 220）
+  micGate: number; // 麥克風環境音閘門 0~40，越高越嚴格（預設 10）
 }
 
 export class PrompterDatabase extends Dexie {
@@ -56,6 +57,7 @@ export const DEFAULT_SETTINGS: PrompterSettings = {
   speechLang: 'zh-TW',
   highlightColor: '#F59E0B',
   speedWpm: 220,
+  micGate: 10,
 };
 
 // 預設示範講稿（繁體中文）
@@ -78,8 +80,8 @@ export const SAMPLE_SCRIPT: Omit<ScriptItem, 'id'> = {
 現在，請深呼吸，按下上方或底部的開始按鈕，大聲唸出這段文字，親身體驗語音跟隨的流暢感吧！祝您演講圓滿精彩！`,
   createdAt: Date.now(),
   updatedAt: Date.now(),
-  wordCount: 350,
-  speechDurationSeconds: 95,
+  wordCount: 337,
+  speechDurationSeconds: 92,
   tags: ['歡迎', '示範', '語音辨識']
 };
 

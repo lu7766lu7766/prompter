@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
 import type { ScriptItem } from '../db';
+import { countEffectiveWords, estimateSpeechSeconds, DEFAULT_WPM } from '../utils/textStats';
 import { 
   ArrowLeft, 
   Save, 
@@ -27,9 +28,9 @@ const content = ref(props.initialScript?.content || '');
 const tagsInput = ref(props.initialScript?.tags?.join(', ') || '');
 const isSaved = ref(true);
 
-// 實時字數計算
+// 實時字數計算（去除標點符號 / 空白，只計有效字元）
 const wordCount = computed(() => {
-  return content.value.replace(/\s+/g, '').length;
+  return countEffectiveWords(content.value);
 });
 
 // 段落數計算
@@ -38,10 +39,9 @@ const paragraphCount = computed(() => {
   return content.value.split(/\n+/).filter(p => p.trim().length > 0).length;
 });
 
-// 預估朗讀時間 (秒數，以每分鐘 220 字計算)
+// 預估朗讀時間 (秒數，以每分鐘 DEFAULT_WPM 字計算)
 const estimatedSeconds = computed(() => {
-  if (wordCount.value === 0) return 0;
-  return Math.round((wordCount.value / 220) * 60);
+  return estimateSpeechSeconds(wordCount.value, DEFAULT_WPM);
 });
 
 function formatDuration(seconds: number): string {
@@ -153,19 +153,19 @@ function handleStartPrompter() {
         ></textarea>
       </div>
 
-      <!-- 即時統計欄 -->
+      <!-- 即時統計欄（字數已去除標點符號 / 空白） -->
       <div class="stats-bar">
-        <div class="stat-badge">
+        <div class="stat-badge" title="已去除標點符號與空白">
           <Hash :size="14" />
-          <span>字數：<strong>{{ wordCount.toLocaleString() }}</strong> 字</span>
+          <span>字數（去標點）：<strong>{{ wordCount.toLocaleString() }}</strong> 字</span>
         </div>
         <div class="stat-badge">
           <Layers :size="14" />
           <span>段落：<strong>{{ paragraphCount }}</strong> 段</span>
         </div>
-        <div class="stat-badge highlight">
+        <div class="stat-badge highlight" :title="`以每分鐘 ${DEFAULT_WPM} 字計算`">
           <Clock :size="14" />
-          <span>預估朗讀時間：<strong>{{ formatDuration(estimatedSeconds) }}</strong></span>
+          <span>預估朗讀時間：<strong>{{ formatDuration(estimatedSeconds) }}</strong><small class="wpm-hint">（{{ DEFAULT_WPM }} 字/分）</small></span>
         </div>
       </div>
     </div>
@@ -304,6 +304,12 @@ function handleStartPrompter() {
 
 .stat-badge.highlight strong {
   color: #22D3EE;
+}
+
+.wpm-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 4px;
 }
 
 @media (max-width: 768px) {

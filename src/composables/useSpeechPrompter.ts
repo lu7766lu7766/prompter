@@ -106,6 +106,17 @@ export function useSpeechPrompter() {
   const lastRecognizedText = ref<string>('');
   const errorMessage = ref<string>('');
   const micVolume = ref<number>(0);
+  // 環境音閘門：音量低於此值且文本又短時，視為環境音不推進（可在 UI 調整）
+  const noiseGateThreshold = ref<number>(10);
+  const lastConfidence = ref<number>(0);
+
+  // 遠距跳段待確認狀態（需連續兩次指向同一區才跳，避免雜音誤跳）
+  let pendingFarCharIndex = -1;
+  let pendingFarHits = 0;
+
+  function setNoiseGate(v: number) {
+    noiseGateThreshold.value = Math.min(40, Math.max(0, Math.round(v)));
+  }
 
   // 當前朗讀匹配到的 Token 索引位置 (-1 表示尚未開始)
   const currentTokenIndex = ref<number>(-1);
@@ -190,6 +201,8 @@ export function useSpeechPrompter() {
 
     tokens.value = list;
     currentTokenIndex.value = -1;
+    pendingFarCharIndex = -1;
+    pendingFarHits = 0;
     buildCleanedCache();
   }
 
@@ -215,19 +228,67 @@ export function useSpeechPrompter() {
     });
   }
 
-  // 規範化文字（去除標點、空白並轉小寫）
+  // 規範化文字（去除所有標點 / 符號 / 空白並轉小寫，與字數統計一致）
   function cleanText(str: string): string {
-    return str
-      .toLowerCase()
-      .replace(/[，。！？、；：「」『』（）《》〈〉—…,.!?;:()\[\]"' \t\r\n]/g, '');
+    return str.toLowerCase().replace(/[\p{P}\p{S}\s]/gu, '');
   }
 
-  // 比對語音轉錄內容與文稿位置（雙層階層搜尋：局部精確追蹤 + 遠距跳段跳篇搜尋）
-  function matchTranscript(transcript: string) {
+  // 在 haystack 中找出離 anchor 最近的 needle 出現位置（解決重複詞永遠命中第一個的問題）
+  function findNearest(haystack: string, needle: string, anchor: number): number {
+    if (!needle) return -1;
+    let best = -1;
+    let bestDist = Infinity;
+    let from = 0;
+    for (;;) {
+      const found = haystack.indexOf(needle, from);
+      if (found === -1) break;
+      // 偏好前方（朗讀多半向前）：後方距離打 1.5 倍折扣，避免同分時亂跳回前文
+      const dist = found <= anchor ? (anchor - found) * 1.5 : found - anchor;
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = found;
+      }
+      from = found + 1;
+    }
+    return best;
+  }
+
+  function charIndexToToken(charIndex: number): number | undefined {
+    if (charIndex < 0 || charIndex >= fullTokenMap.length) return undefined;
+    return fullTokenMap[charIndex];
+  }
+
+  function commitCharIndex(matchCharIndex: number) {
+    const targetTokenIdx = charIndexToToken(matchCharIndex);
+    if (targetTokenIdx !== undefined && targetTokenIdx !== currentTokenIndex.value) {
+      currentTokenIndex.value = targetTokenIdx;
+    }
+  }
+
+  // 比對語音轉錄內容與文稿位置
+  // 策略：200 字窗內靈敏跟隨（取最長 anchor + 離現況最近者）；窗外遠跳需確認（final 強 anchor 直接跳，否則連兩次才跳）
+  function matchTranscript(
+    transcript: string,
+    opts?: { isFinal?: boolean; confidence?: number; volume?: number }
+  ) {
     const cleanedTranscript = cleanText(transcript);
     if (!cleanedTranscript || fullCleanedText.length === 0) return;
 
     lastRecognizedText.value = transcript;
+    const isFinal = opts?.isFinal ?? false;
+    const confidence = opts?.confidence ?? 0;
+    if (typeof confidence === 'number' && confidence > 0) {
+      lastConfidence.value = confidence;
+    }
+    const volume = opts?.volume ?? micVolume.value;
+
+    // ---- 環境音閘門（現場雜音時不推進） ----
+    // 太短的 interim 碎片多半是雜音
+    if (!isFinal && cleanedTranscript.length < 2) return;
+    // 音量低 + 文本短：視為環境音
+    if (volume < noiseGateThreshold.value && cleanedTranscript.length < 6) return;
+    // 瀏覽器明確回報低信心（0 視為未知，不擋）
+    if (!isFinal && confidence > 0 && confidence < 0.35) return;
 
     // 取得當前朗讀進度在全文中的字元索引
     const currentIdx = currentTokenIndex.value;
@@ -236,90 +297,85 @@ export function useSpeechPrompter() {
       currentCharPos = tokenFirstCharIndex[currentIdx];
     }
 
-    let matchCharIndex = -1;
-
-    // ========== 第一階段：局部窗口搜尋 (優先防漂移) ==========
-    // 在當前進度附近（前 15 字 ~ 後 90 字）尋找匹配，確保正常連續朗讀時平穩鎖定
-    const localStart = Math.max(0, currentCharPos - 15);
-    const localEnd = Math.min(fullCleanedText.length, currentCharPos + 90);
+    // ========== 第一階段：200 字窗內跟隨 ==========
+    const TRACK_BEFORE = 200;
+    const TRACK_AFTER = 200;
+    const localStart = Math.max(0, currentCharPos - TRACK_BEFORE);
+    const localEnd = Math.min(fullCleanedText.length, currentCharPos + TRACK_AFTER);
     const localSlice = fullCleanedText.slice(localStart, localEnd);
+    const localAnchor = currentCharPos - localStart;
 
-    const queryLen = Math.min(cleanedTranscript.length, 8);
-    const querySuffix = cleanedTranscript.slice(-queryLen);
-
-    // 1. 局部末端比對（長度從 queryLen 遞減到 2）
-    for (let len = queryLen; len >= 2; len--) {
-      const sub = querySuffix.slice(-len);
-      const found = localSlice.indexOf(sub);
+    const maxLocalLen = Math.min(cleanedTranscript.length, 12);
+    for (let len = maxLocalLen; len >= 2; len--) {
+      // 短 anchor 只允許推進一小步時使用，避免 2~3 字重複詞亂跳：
+      // 非 final 且 len < 4 時，只接受「向前小步」（40 字內）
+      const sub = cleanedTranscript.slice(-len);
+      const found = findNearest(localSlice, sub, localAnchor);
       if (found !== -1) {
-        matchCharIndex = localStart + found + len - 1;
+        const absIdx = localStart + found + len - 1;
+        const delta = absIdx - currentCharPos;
+        if (!isFinal && len < 4 && (delta < 0 || delta > 40)) continue;
+        // 後退需較強證據：interim 後退只接受 len >= 5
+        if (!isFinal && delta < 0 && len < 5) continue;
+        commitCharIndex(absIdx);
+        // 窗內命中即清除遠跳待確認（已回到正常跟隨）
+        pendingFarCharIndex = -1;
+        pendingFarHits = 0;
+        return;
+      }
+      // 長 anchor 優先：len >= 6 若沒找到才往更短嘗試；短 anchor 找到也可能誤判，
+      // 但上面已加 delta / 後退 guards，可接受
+    }
+
+    // ========== 第二階段：窗外遠跳（需確認） ==========
+    // interim 碎片不做遠跳；至少需要 6 字才考慮
+    if (!isFinal || cleanedTranscript.length < 6) return;
+
+    const anchorMaxLen = Math.min(cleanedTranscript.length, 12);
+    let candidate = -1;
+    let candidateLen = 0;
+
+    // (A) 前方遠處（窗外之後）：anchor 12 -> 8
+    const forwardStart = Math.min(fullCleanedText.length, currentCharPos + TRACK_AFTER);
+    const forwardText = fullCleanedText.slice(forwardStart);
+    for (let len = anchorMaxLen; len >= 8; len--) {
+      const sub = cleanedTranscript.slice(-len);
+      const found = forwardText.indexOf(sub);
+      if (found !== -1) {
+        candidate = forwardStart + found + len - 1;
+        candidateLen = len;
         break;
       }
     }
 
-    // 2. 局部整句比對
-    if (matchCharIndex === -1 && cleanedTranscript.length >= 3) {
-      for (let len = Math.min(cleanedTranscript.length, 6); len >= 2; len--) {
+    // (B) 後方遠處（跳回前文）：需要更長 anchor（12 -> 10），避免重複詞誤判
+    if (candidate === -1) {
+      const backEnd = Math.max(0, currentCharPos - TRACK_BEFORE);
+      const backText = fullCleanedText.slice(0, backEnd);
+      for (let len = anchorMaxLen; len >= 10; len--) {
         const sub = cleanedTranscript.slice(-len);
-        const found = localSlice.lastIndexOf(sub);
+        const found = backText.lastIndexOf(sub);
         if (found !== -1) {
-          matchCharIndex = localStart + found + len - 1;
+          candidate = found + len - 1;
+          candidateLen = len;
           break;
         }
       }
     }
 
-    // ========== 第二階段：遠程跨段落搜尋 (支援跳一段、跳兩段或跳大章節) ==========
-    // 當局部窗口完全無法吻合時，代表講者跳過內容或念了遠處段落
-    if (matchCharIndex === -1 && cleanedTranscript.length >= 3) {
-      const anchorMaxLen = Math.min(cleanedTranscript.length, 12);
-      const anchorSuffix = cleanedTranscript.slice(-anchorMaxLen);
+    if (candidate === -1) return;
 
-      // (A) 優先搜尋前方遠處段落（從當前位置 + 30 之後往後找）
-      const forwardStart = Math.min(fullCleanedText.length, currentCharPos + 30);
-      const forwardText = fullCleanedText.slice(forwardStart);
-
-      // 優先用末端 3~12 個字元比對後續段落
-      for (let len = anchorMaxLen; len >= 3; len--) {
-        const sub = anchorSuffix.slice(-len);
-        const found = forwardText.indexOf(sub);
-        if (found !== -1) {
-          matchCharIndex = forwardStart + found + len - 1;
-          break;
-        }
-      }
-
-      // (B) 若末端沒對到，用最新整句或開頭 4~10 個字元在後續段落尋找
-      if (matchCharIndex === -1 && cleanedTranscript.length >= 4) {
-        for (let len = Math.min(cleanedTranscript.length, 10); len >= 4; len--) {
-          const sub = cleanedTranscript.slice(0, len);
-          const found = forwardText.indexOf(sub);
-          if (found !== -1) {
-            matchCharIndex = forwardStart + found + len - 1;
-            break;
-          }
-        }
-      }
-
-      // (C) 全文範圍廣域比對（支援大跨度跳轉或跳回前文）
-      if (matchCharIndex === -1 && anchorMaxLen >= 4) {
-        for (let len = anchorMaxLen; len >= 4; len--) {
-          const sub = anchorSuffix.slice(-len);
-          const found = fullCleanedText.indexOf(sub);
-          if (found !== -1) {
-            matchCharIndex = found + len - 1;
-            break;
-          }
-        }
-      }
+    // 確認機制：連續兩次指向同一 ±60 字區才跳；final + 強 anchor（>=10）可直接跳
+    if (pendingFarCharIndex >= 0 && Math.abs(candidate - pendingFarCharIndex) <= 60) {
+      pendingFarHits += 1;
+    } else {
+      pendingFarCharIndex = candidate;
+      pendingFarHits = 1;
     }
-
-    // ========== 更新朗讀 Token 位置 ==========
-    if (matchCharIndex >= 0 && matchCharIndex < fullTokenMap.length) {
-      const targetTokenIdx = fullTokenMap[matchCharIndex];
-      if (targetTokenIdx !== undefined && targetTokenIdx !== currentTokenIndex.value) {
-        currentTokenIndex.value = targetTokenIdx;
-      }
+    if (pendingFarHits >= 2 || candidateLen >= 10) {
+      commitCharIndex(candidate);
+      pendingFarCharIndex = -1;
+      pendingFarHits = 0;
     }
   }
 
@@ -341,10 +397,16 @@ export function useSpeechPrompter() {
     }
   }
 
-  // 麥克風音量即時監聽
+  // 麥克風音量即時監聽（含降噪約束 + 平滑，避免環境音瞬間峰值誤觸）
   async function startAudioMonitor() {
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+      } catch {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       const source = audioContext.createMediaStreamSource(mediaStream);
       analyser = audioContext.createAnalyser();
@@ -352,6 +414,7 @@ export function useSpeechPrompter() {
       source.connect(analyser);
 
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      let smoothed = 0;
       const updateVolume = () => {
         if (!analyser) return;
         analyser.getByteFrequencyData(dataArray);
@@ -360,7 +423,9 @@ export function useSpeechPrompter() {
           sum += dataArray[i];
         }
         const avg = sum / dataArray.length;
-        micVolume.value = Math.min(100, Math.round((avg / 128) * 100));
+        const instant = Math.min(100, Math.round((avg / 128) * 100));
+        smoothed = smoothed * 0.7 + instant * 0.3;
+        micVolume.value = Math.round(smoothed);
         animFrameId = requestAnimationFrame(updateVolume);
       };
       updateVolume();
@@ -401,7 +466,7 @@ export function useSpeechPrompter() {
         recognition = new SpeechRecognitionClass();
         recognition.continuous = true;
         recognition.interimResults = true;
-        recognition.maxAlternatives = 1;
+        recognition.maxAlternatives = 3;
       }
 
       recognition.lang = speechLang.value;
@@ -413,20 +478,31 @@ export function useSpeechPrompter() {
       recognition.onresult = (event: SpeechRecognitionEvent) => {
         let interim = '';
         let final = '';
+        let bestConfidence = 0;
+        let hasFinal = false;
 
         for (let i = event.resultIndex; i < event.results.length; ++i) {
           const res = event.results[i];
+          const alt = res[0];
+          const conf = typeof alt?.confidence === 'number' ? alt.confidence : 0;
+          if (conf > bestConfidence) bestConfidence = conf;
           if (res.isFinal) {
-            final += res[0].transcript;
+            hasFinal = true;
+            final += alt?.transcript ?? '';
           } else {
-            interim += res[0].transcript;
+            interim += alt?.transcript ?? '';
           }
         }
+        if (bestConfidence > 0) lastConfidence.value = bestConfidence;
 
         interimText.value = interim || final;
         const textToMatch = final || interim;
         if (textToMatch) {
-          matchTranscript(textToMatch);
+          matchTranscript(textToMatch, {
+            isFinal: hasFinal,
+            confidence: bestConfidence,
+            volume: micVolume.value
+          });
         }
       };
 
@@ -492,6 +568,8 @@ export function useSpeechPrompter() {
   function jumpToTokenIndex(index: number) {
     if (index >= -1 && index < tokens.value.length) {
       currentTokenIndex.value = index;
+      pendingFarCharIndex = -1;
+      pendingFarHits = 0;
     }
   }
 
@@ -499,6 +577,8 @@ export function useSpeechPrompter() {
     currentTokenIndex.value = -1;
     interimText.value = '';
     lastRecognizedText.value = '';
+    pendingFarCharIndex = -1;
+    pendingFarHits = 0;
   }
 
   onUnmounted(() => {
@@ -517,8 +597,11 @@ export function useSpeechPrompter() {
     speechLang,
     interimText,
     lastRecognizedText,
+    lastConfidence,
     errorMessage,
     micVolume,
+    noiseGateThreshold,
+    setNoiseGate,
     tokens,
     currentTokenIndex,
     progressPercent,

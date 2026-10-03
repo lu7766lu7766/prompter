@@ -27,11 +27,12 @@ const emit = defineEmits<{
 }>();
 
 // 提詞設定狀態（自動滾動與語音辨識皆為獨立開關）
-const settings = ref<PrompterSettings>({ 
+const settings = ref<PrompterSettings>({
   ...props.initialSettings,
   enableAutoScroll: props.initialSettings.enableAutoScroll ?? true,
   enableVoice: props.initialSettings.enableVoice ?? true,
   scrollSpeed: props.initialSettings.scrollSpeed || 3,
+  micGate: props.initialSettings.micGate ?? 10,
   showGuideLine: true,
   mirrorH: false,
   mirrorV: false
@@ -43,6 +44,9 @@ const {
   isListening,
   speechLang,
   errorMessage,
+  micVolume,
+  noiseGateThreshold,
+  setNoiseGate,
   tokens,
   currentTokenIndex,
   progressPercent,
@@ -101,29 +105,59 @@ let scrollAccumulator = 0;
 let animFrameId: number | null = null;
 let lastScrollTimestamp = 0;
 
+// 語音跟隨統一捲動控制器：語音只設定目標，由同一個 rAF 迴圈做平滑趨近，
+// 避免每個 token 觸發一次原生 smooth scroll 互相搶奪造成抖動
+let voiceScrollTarget: number | null = null;
+let lastVoiceTargetAt = 0;
+let lastManualScrollAt = 0;
+const reduceMotion = typeof window !== 'undefined' &&
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 const scrollContainerRef = ref<HTMLElement | null>(null);
 
-// 自動滾動動畫循環
+// 自動滾動 + 語音跟隨共用動畫循環
 function runAutoScrollLoop(timestamp: number) {
   if (!lastScrollTimestamp) lastScrollTimestamp = timestamp;
   const deltaSeconds = Math.min((timestamp - lastScrollTimestamp) / 1000, 0.1);
   lastScrollTimestamp = timestamp;
 
-  if (settings.value.enableAutoScroll && isAutoScrolling.value && scrollContainerRef.value) {
-    const speedPxPerSec = 4 + settings.value.scrollSpeed * 16;
-    scrollAccumulator += speedPxPerSec * deltaSeconds;
-    scrollContainerRef.value.scrollTop = scrollAccumulator;
+  const container = scrollContainerRef.value;
+  if (container) {
+    const hasFreshVoiceTarget = settings.value.enableVoice &&
+      voiceScrollTarget !== null &&
+      timestamp - lastVoiceTargetAt < 3000 &&
+      timestamp - lastManualScrollAt > 2500;
+
+    if (hasFreshVoiceTarget && voiceScrollTarget !== null) {
+      const diff = voiceScrollTarget - scrollAccumulator;
+      if (Math.abs(diff) < 1) {
+        scrollAccumulator = voiceScrollTarget;
+        container.scrollTop = scrollAccumulator;
+      } else if (reduceMotion) {
+        scrollAccumulator = voiceScrollTarget;
+        container.scrollTop = scrollAccumulator;
+      } else {
+        scrollAccumulator += diff * Math.min(1, deltaSeconds * 5);
+        container.scrollTop = scrollAccumulator;
+      }
+    } else if (settings.value.enableAutoScroll && isAutoScrolling.value) {
+      const speedPxPerSec = 4 + settings.value.scrollSpeed * 16;
+      scrollAccumulator += speedPxPerSec * deltaSeconds;
+      container.scrollTop = scrollAccumulator;
+    }
   }
 
   animFrameId = requestAnimationFrame(runAutoScrollLoop);
 }
 
-// 監聽容器手動滾動（滑鼠滾輪/觸控手勢/捲軸拖曳），同步累計器
+// 監聽容器手動滾動（滑鼠滾輪/觸控手勢/捲軸拖曳），同步累計器並短暫抑制語音拉回
 function handleContainerScroll() {
   if (!scrollContainerRef.value) return;
   const current = scrollContainerRef.value.scrollTop;
   if (Math.abs(current - scrollAccumulator) > 2) {
     scrollAccumulator = current;
+    lastManualScrollAt = performance.now();
   }
 }
 
@@ -148,6 +182,7 @@ function toggleVoice() {
       startListening();
     }
   } else {
+    voiceScrollTarget = null;
     stopListening();
   }
 }
@@ -195,6 +230,8 @@ onMounted(() => {
   animFrameId = requestAnimationFrame(runAutoScrollLoop);
   window.addEventListener('keydown', handleKeyDown);
   document.addEventListener('fullscreenchange', handleFullscreenChange);
+  setNoiseGate(settings.value.micGate ?? 10);
+  noiseGateThreshold.value = settings.value.micGate ?? 10;
 
   nextTick(() => {
     if (scrollContainerRef.value) {
@@ -213,7 +250,7 @@ onUnmounted(() => {
   document.removeEventListener('fullscreenchange', handleFullscreenChange);
 });
 
-// 當前語音朗讀字詞改變時，若開啟語音辨識則自動平滑對齊
+// 當前語音朗讀字詞改變時，只設定跟隨目標，由 rAF 迴圈平滑趨近（避免連發 smooth scroll 打架抖動）
 watch(currentTokenIndex, (newIdx) => {
   if (!settings.value.enableVoice || newIdx < 0 || !scrollContainerRef.value) return;
 
@@ -228,12 +265,17 @@ watch(currentTokenIndex, (newIdx) => {
     const offset = elRect.top - containerRect.top;
     const targetScrollTop = container.scrollTop + offset - (containerRect.height / 2) + (elRect.height / 2);
 
-    scrollAccumulator = targetScrollTop;
-    container.scrollTo({
-      top: targetScrollTop,
-      behavior: 'smooth'
-    });
+    // 微小位移不更新目標，減少逐字推進時的抖動
+    if (voiceScrollTarget !== null && Math.abs(targetScrollTop - voiceScrollTarget) < 24) return;
+
+    voiceScrollTarget = targetScrollTop;
+    lastVoiceTargetAt = performance.now();
   });
+});
+
+// 收音閘門變更即時套用到底層引擎
+watch(() => settings.value.micGate, (v) => {
+  setNoiseGate(v ?? 10);
 });
 
 // 監聽設定變更並保存
@@ -319,6 +361,7 @@ function handleKeyDown(e: KeyboardEvent) {
 
 function handleReset() {
   resetProgress();
+  voiceScrollTarget = null;
   scrollAccumulator = 0;
   if (scrollContainerRef.value) {
     scrollContainerRef.value.scrollTo({ top: 0, behavior: 'smooth' });
@@ -545,6 +588,26 @@ function handleReset() {
                 step="20" 
               />
             </div>
+
+            <!-- 收音閘門（過濾環境音，越高越嚴格） -->
+            <div class="ctrl-slider-item gate-slider" :class="{ disabled: !settings.enableVoice }" title="現場吵雜時調高；講話小聲會跟不上時調低">
+              <div class="slider-header">
+                <span>收音閘門</span>
+                <span class="slider-val">{{ settings.micGate }}</span>
+              </div>
+              <input
+                v-model.number="settings.micGate"
+                type="range"
+                min="0"
+                max="40"
+                step="1"
+                :disabled="!settings.enableVoice"
+              />
+              <div class="mic-meter">
+                <div class="mic-meter-fill" :style="{ width: `${Math.min(100, micVolume)}%` }"></div>
+                <div class="mic-gate-mark" :style="{ left: `${Math.min(100, settings.micGate)}%` }"></div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -622,6 +685,11 @@ function handleReset() {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
+}
+
+.top-left {
+  flex: 1 1 auto;
 }
 
 .btn-top-exit {
@@ -649,16 +717,19 @@ function handleReset() {
   align-items: baseline;
   gap: 8px;
   overflow: hidden;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .script-title {
   font-size: 14px;
   font-weight: 700;
   color: var(--text-primary);
-  max-width: 220px;
+  max-width: clamp(90px, 28vw, 220px);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .progress-label {
@@ -824,15 +895,18 @@ function handleReset() {
   100% { opacity: 0; transform: translate(-50%, 0); }
 }
 
-/* 懸浮控制面板 */
+/* 懸浮控制面板：流體 RWD（依容器寬度自動換行，不綁特定機型） */
 .floating-controls {
   position: absolute;
-  bottom: 24px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   padding: 14px 20px;
   z-index: 60;
-  max-width: 95vw;
+  width: min(940px, calc(100vw - 24px));
+  max-height: calc(100dvh - 160px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-sizing: border-box;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
   cursor: default;
@@ -840,15 +914,31 @@ function handleReset() {
 
 .controls-grid {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  justify-content: center;
+  gap: 12px 16px;
 }
 
 .ctrl-group.main-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  flex-shrink: 0;
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.ctrl-group.main-actions .btn {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.ctrl-group.main-actions .btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .ctrl-group.disabled, .ctrl-slider-item.disabled {
@@ -864,20 +954,55 @@ function handleReset() {
 }
 
 .ctrl-sliders-row {
-  display: flex;
-  align-items: center;
-  gap: 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 12px 16px;
+  flex: 2 1 320px;
+  min-width: 0;
+  width: 100%;
+  align-items: start;
 }
 
 .ctrl-slider-item {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  width: 100px;
+  width: 100%;
+  min-width: 0;
 }
 
 .ctrl-slider-item.speed-slider {
-  width: 140px;
+  width: 100%;
+  min-width: 0;
+}
+
+/* 收音閘門即時音量條（綠條=目前音量，白線=閘門位置） */
+.mic-meter {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.mic-meter-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: linear-gradient(90deg, #10B981, #22D3EE);
+  border-radius: 3px;
+  transition: width 0.12s linear;
+}
+
+.mic-gate-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.85);
 }
 
 .speed-presets {
@@ -978,14 +1103,50 @@ kbd {
   opacity: 0;
 }
 
-/* 手機與平板適應性排版（解決跑版問題） */
-@media (max-width: 768px) {
+/* 流體 RWD 斷點（依排版需求，非特定機型） */
+/* 中等寬度：工具列轉為上下堆疊，隱藏直式分隔線 */
+@media (max-width: 960px) {
+  .controls-grid {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .ctrl-divider {
+    display: none;
+  }
+
+  .ctrl-group.main-actions {
+    flex-basis: auto;
+    width: 100%;
+  }
+
+  .ctrl-sliders-row {
+    flex-basis: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ctrl-slider-item.speed-slider {
+    grid-column: 1 / -1;
+  }
+
+  .floating-controls {
+    padding: 12px 14px;
+  }
+}
+
+/* 窄寬度：頂列與按鈕收斂，slider 維持可讀不爆版 */
+@media (max-width: 640px) {
   .prompter-top-bar {
     padding: 8px 12px;
+    gap: 8px;
+  }
+
+  .top-left, .top-right {
+    min-width: 0;
+    gap: 8px;
   }
 
   .script-title {
-    max-width: 130px;
     font-size: 13px;
   }
 
@@ -993,32 +1154,25 @@ kbd {
     padding: 5px 8px;
     font-size: 12px;
     gap: 4px;
+    flex-shrink: 0;
   }
 
   .btn-icon-top {
     width: 32px;
     height: 32px;
+    flex-shrink: 0;
   }
 
   .floating-controls {
-    bottom: 12px;
-    width: calc(100% - 20px);
-    max-width: 440px;
-    padding: 12px;
-    border-radius: var(--radius-lg);
-  }
-
-  .controls-grid {
-    flex-direction: column;
-    gap: 10px;
-    width: 100%;
+    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 120px);
   }
 
   .ctrl-group.main-actions {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 6px;
-    width: 100%;
   }
 
   .ctrl-group.main-actions .btn {
@@ -1026,9 +1180,6 @@ kbd {
     font-size: 11px;
     justify-content: center;
     text-align: center;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .ctrl-group.main-actions .btn span {
@@ -1039,33 +1190,15 @@ kbd {
     display: none !important;
   }
 
-  .ctrl-sliders-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    width: 100%;
-  }
-
-  .ctrl-slider-item {
-    width: 100%;
-  }
-
-  .ctrl-slider-item.speed-slider {
-    grid-column: 1 / -1;
-    width: 100%;
+  .tap-hint-pill {
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    max-width: calc(100vw - 32px);
+    white-space: normal;
+    text-align: center;
   }
 }
 
-@media (max-width: 480px) {
-  .prompter-top-bar {
-    padding: 6px 10px;
-  }
-
-  .script-title {
-    max-width: 90px;
-    font-size: 12px;
-  }
-
+@media (max-width: 400px) {
   .top-left, .top-right {
     gap: 6px;
   }
@@ -1077,6 +1210,10 @@ kbd {
 
   .ctrl-group.main-actions .btn span {
     font-size: 10px;
+  }
+
+  .ctrl-sliders-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>
