@@ -132,6 +132,17 @@ export function useSpeechPrompter() {
   let wakeLock: any = null;
   let shouldKeepListening = false;
 
+  // 重連狀態（解決長會話跑一段時間後引擎靜默死亡、需重整才恢復的問題）
+  const isReconnecting = ref<boolean>(false);
+  const lastResultAt = ref<number>(0); // 上次收到辨識結果的時間（Date.now），0 表尚未收到
+  const statusTick = ref<number>(0); // 看門狗心跳計數，供 UI 重算「最後辨識 N 秒前」
+  let starting = false; // 啟動中旗標，防併發 start()
+  let restartTimer: ReturnType<typeof setTimeout> | null = null;
+  let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  let restartAttempts = 0;
+  let sessionStartAt = 0;
+  let lastLoudAt = 0; // 上次麥克風音量超過閘門的時間（判斷使用者是否正在說話）
+
   // 將原始文稿解析為結構化 Token 清單
   function parseScriptToTokens(content: string) {
     // 自動判斷並套用辨識語言
@@ -399,6 +410,8 @@ export function useSpeechPrompter() {
 
   // 麥克風音量即時監聽（含降噪約束 + 平滑，避免環境音瞬間峰值誤觸）
   async function startAudioMonitor() {
+    // 防重入：已有監聽先拆掉，避免重試啟動時佔用兩條音軌
+    stopAudioMonitor();
     try {
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -462,20 +475,36 @@ export function useSpeechPrompter() {
     shouldKeepListening = true;
 
     try {
-      if (!recognition) {
-        recognition = new SpeechRecognitionClass();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.maxAlternatives = 3;
-      }
+      // 全新會話狀態；實例一律由 doBoot 建立（首次與重連皆然，避免沿用卡死實例）
+      sessionStartAt = 0;
+      lastResultAt.value = 0;
+      lastLoudAt = 0;
+      restartAttempts = 0;
+      isReconnecting.value = false;
 
-      recognition.lang = speechLang.value;
+      doBoot();
+      startAudioMonitor();
+      startWatchdog();
+      requestWakeLock();
+    } catch (err: any) {
+      console.error('Failed to start speech recognition:', err);
+      errorMessage.value = '啟動語音識別失敗：' + (err?.message || '請確認麥克風設置');
+      isListening.value = false;
+    }
+  }
 
-      recognition.onstart = () => {
-        isListening.value = true;
-      };
+  // 將四個事件處理器掛到指定實例（每次重建新實例都呼叫一次）
+  function attachHandlers(r: ISpeechRecognition) {
+    r.onstart = () => {
+      starting = false;
+      restartAttempts = 0;
+      isListening.value = true;
+      isReconnecting.value = false;
+      if (!sessionStartAt) sessionStartAt = Date.now();
+      errorMessage.value = '';
+    };
 
-      recognition.onresult = (event: SpeechRecognitionEvent) => {
+    r.onresult = (event: SpeechRecognitionEvent) => {
         let interim = '';
         let final = '';
         let bestConfidence = 0;
@@ -495,6 +524,10 @@ export function useSpeechPrompter() {
         }
         if (bestConfidence > 0) lastConfidence.value = bestConfidence;
 
+        lastResultAt.value = Date.now();
+        // 有結果流入代表引擎健康，重設計數器
+        restartAttempts = 0;
+        if (isReconnecting.value) isReconnecting.value = false;
         interimText.value = interim || final;
         const textToMatch = final || interim;
         if (textToMatch) {
@@ -506,52 +539,164 @@ export function useSpeechPrompter() {
         }
       };
 
-      recognition.onerror = (event: any) => {
-        if (event.error === 'no-speech') {
-          // 靜音屬正常現象，不報錯
+    r.onerror = (event: any) => {
+        const code = event?.error as string | undefined;
+        if (code === 'no-speech') {
+          // 靜音屬正常現象，不報錯（onend 會接著觸發重連）
           return;
         }
-        if (event.error === 'not-allowed') {
+        if (code === 'not-allowed' || code === 'service-not-allowed') {
           errorMessage.value = '麥克風存取被拒絕，請至瀏覽器網址列左側允許麥克風權限。';
           shouldKeepListening = false;
           stopListening();
-        } else {
-          console.warn('Speech recognition warning/error:', event.error);
+          return;
         }
+        if (code === 'audio-capture') {
+          errorMessage.value = '找不到可用的麥克風（可能被其他程式佔用或裝置休眠），重連中…';
+        } else if (code === 'network') {
+          errorMessage.value = '語音辨識需要連網，網路異常時會自動重連…';
+        } else {
+          console.warn('Speech recognition warning/error:', code);
+        }
+        // 致命類錯誤（network / audio-capture / aborted / language 等）：
+        // 丟棄舊實例，下次用全新實例啟動；onend 若跟著觸發則不再重複排程
+        destroyRecognitionInstance();
+        scheduleRestart(backoffDelay());
       };
 
-      recognition.onend = () => {
-        // 連續識別模式自動重新連線
-        if (shouldKeepListening) {
-          try {
-            recognition?.start();
-          } catch (err) {
-            // 已在啟動狀態
-          }
-        } else {
-          isListening.value = false;
-        }
-      };
+    r.onend = () => {
+      starting = false;
+      if (!shouldKeepListening) {
+        isListening.value = false;
+        isReconnecting.value = false;
+        return;
+      }
+      // 已有排程（例如 onerror 剛排過）就不再重複排
+      if (restartTimer) return;
+      scheduleRestart(backoffDelay());
+    };
+  }
 
-      recognition.start();
-      startAudioMonitor();
-      requestWakeLock();
-    } catch (err: any) {
-      console.error('Failed to start speech recognition:', err);
-      errorMessage.value = '啟動語音識別失敗：' + (err?.message || '請確認麥克風設置');
-      isListening.value = false;
+  // 退避延遲：400ms → 800ms → 1500ms → 2500ms封頂，避免緊迴圈被瀏覽器節流
+  function backoffDelay(): number {
+    const steps = [400, 800, 1500, 2500];
+    return steps[Math.min(restartAttempts, steps.length - 1)];
+  }
+
+  // 拆掉舊實例（不動排程計時器，供錯誤復原使用）
+  function destroyRecognitionInstance() {
+    const r = recognition;
+    recognition = null;
+    starting = false;
+    if (r) {
+      r.onstart = null;
+      r.onresult = null;
+      r.onerror = null;
+      r.onend = null;
+      try {
+        r.abort();
+      } catch (e) {}
+    }
+  }
+
+  // 排程重啟（冪等：重複呼叫只會重設計時器）
+  function scheduleRestart(delayMs: number) {
+    if (!shouldKeepListening) return;
+    if (restartTimer) {
+      clearTimeout(restartTimer);
+      restartTimer = null;
+    }
+    // 曾經成功跑過才顯示「重連中」，首次啟動失敗不閃爍
+    if (isListening.value) isReconnecting.value = true;
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      restartAttempts += 1;
+      doBoot();
+    }, delayMs);
+  }
+
+  // 用全新實例啟動一次辨識（每次重連都建新實例，避免沿用卡死的舊實例）
+  function doBoot() {
+    if (!shouldKeepListening || starting) return;
+    const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionClass) return;
+    // 先清掉可能卡死的舊實例
+    destroyRecognitionInstance();
+    starting = true;
+
+    const r = new SpeechRecognitionClass();
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 3;
+    r.lang = speechLang.value;
+    attachHandlers(r);
+
+    recognition = r;
+    try {
+      r.start();
+    } catch (err) {
+      // 同步啟動失敗（例如前一次還沒完全釋放）：退避重試，不吞掉狀態
+      starting = false;
+      scheduleRestart(backoffDelay());
+    }
+  }
+
+  // 看門狗：每 2 秒檢查一次
+  // 1) 有音量（使用者正在說話）卻久無辨識結果 → 實例已 wedged，重建
+  // 2) 單一會話超過約 4 分鐘 → 預防性重建，繞過 Chrome 長會話自動斷線
+  // 3) AudioContext 被系統暫停 → 嘗試恢復，讓音量條與閘門保持可信
+  function startWatchdog() {
+    stopWatchdog();
+    watchdogTimer = setInterval(() => {
+      statusTick.value += 1;
+      if (!shouldKeepListening) return;
+      const now = Date.now();
+
+      if (micVolume.value > noiseGateThreshold.value) {
+        lastLoudAt = now;
+      }
+
+      if (audioContext && audioContext.state === 'suspended') {
+        audioContext.resume().catch(() => {});
+      }
+
+      const speakingRecently = now - lastLoudAt < 5000;
+      const resultAge = lastResultAt.value === 0 ? now - sessionStartAt : now - lastResultAt.value;
+      // 使用者有在說話、會話已開始超過 12 秒，卻 10 秒以上無結果 → 重建
+      if (speakingRecently && sessionStartAt > 0 && now - sessionStartAt > 12000 && resultAge > 10000) {
+        destroyRecognitionInstance();
+        scheduleRestart(400);
+        return;
+      }
+
+      // 預防性重建：單一會話超過 4 分鐘（位置保留在 currentTokenIndex，不受影響）
+      if (sessionStartAt > 0 && now - sessionStartAt > 4 * 60 * 1000) {
+        sessionStartAt = now;
+        lastResultAt.value = 0;
+        destroyRecognitionInstance();
+        scheduleRestart(400);
+      }
+    }, 2000);
+  }
+
+  function stopWatchdog() {
+    if (watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = null;
+    }
+    if (restartTimer) {
+      clearTimeout(restartTimer);
+      restartTimer = null;
     }
   }
 
   function stopListening() {
     shouldKeepListening = false;
     isListening.value = false;
+    isReconnecting.value = false;
     interimText.value = '';
-    if (recognition) {
-      try {
-        recognition.stop();
-      } catch (e) {}
-    }
+    stopWatchdog();
+    destroyRecognitionInstance();
     stopAudioMonitor();
     releaseWakeLock();
   }
@@ -594,6 +739,9 @@ export function useSpeechPrompter() {
   return {
     isSupported,
     isListening,
+    isReconnecting,
+    lastResultAt,
+    statusTick,
     speechLang,
     interimText,
     lastRecognizedText,

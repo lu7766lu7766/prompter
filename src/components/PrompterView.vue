@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import type { ScriptItem, PrompterSettings } from '../db';
 import { useSpeechPrompter, detectLanguage } from '../composables/useSpeechPrompter';
 import { 
@@ -42,6 +42,9 @@ const settings = ref<PrompterSettings>({
 const {
   isSupported,
   isListening,
+  isReconnecting,
+  lastResultAt,
+  statusTick,
   speechLang,
   errorMessage,
   micVolume,
@@ -359,6 +362,21 @@ function handleKeyDown(e: KeyboardEvent) {
   }
 }
 
+// 距上次辨識結果秒數（依看門狗心跳重算；-1 表尚無結果）
+const secsSinceResult = computed(() => {
+  void statusTick.value;
+  if (!lastResultAt.value) return -1;
+  return Math.max(0, Math.floor((Date.now() - lastResultAt.value) / 1000));
+});
+
+// 停滯警告：收音中、非重連、且超過 20 秒無結果（看門狗已在自動重建）
+const showStaleWarn = computed(() =>
+  settings.value.enableVoice &&
+  isListening.value &&
+  !isReconnecting.value &&
+  secsSinceResult.value > 20
+);
+
 function handleReset() {
   resetProgress();
   voiceScrollTarget = null;
@@ -413,6 +431,11 @@ function handleReset() {
     <div v-if="errorMessage && settings.enableVoice" class="error-banner glass-panel">
       <span>{{ errorMessage }}</span>
       <button class="btn btn-secondary btn-sm" @click="startListening">重試授權</button>
+    </div>
+
+    <!-- 辨識停滯警告（看門狗重建多次仍無結果時才出現） -->
+    <div v-if="showStaleWarn" class="stale-banner glass-panel">
+      <span>已 {{ secsSinceResult }} 秒沒有辨識結果，系統重連中；若持續發生請檢查網路連線或重按語音開關。</span>
     </div>
 
     <!-- 視覺焦點水平指示線 (Spotlight Focus Line) -->
@@ -505,11 +528,11 @@ function handleReset() {
               class="btn"
               :class="settings.enableVoice && isListening ? 'btn-cyan' : 'btn-secondary'"
               @click="toggleVoice"
-              title="開關語音辨識 (快捷鍵 V)"
+              :title="`開關語音辨識 (快捷鍵 V)${secsSinceResult >= 0 ? `，最後辨識 ${secsSinceResult} 秒前` : ''}`"
             >
               <Mic v-if="settings.enableVoice && isListening" :size="16" />
               <MicOff v-else :size="16" />
-              <span>語音辨識: {{ settings.enableVoice ? (isListening ? '收音中' : '暫停') : '關閉' }}</span>
+              <span>語音辨識: {{ settings.enableVoice ? (isReconnecting ? '重連中…' : (isListening ? '收音中' : '暫停')) : '關閉' }}</span>
             </button>
 
             <button class="btn btn-secondary" @click="handleReset" title="回到文稿最開頭">
@@ -777,6 +800,29 @@ function handleReset() {
   height: 100%;
   background: linear-gradient(90deg, #F59E0B 0%, #06B6D4 100%);
   transition: width 0.2s ease-out;
+}
+
+/* 錯誤 / 停滯提示條 */
+.error-banner, .stale-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px 16px;
+  font-size: 13px;
+  z-index: 50;
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  text-align: center;
+}
+
+.error-banner {
+  color: #FCA5A5;
+}
+
+.stale-banner {
+  color: #FBBF24;
 }
 
 /* 視覺焦點指示線 */
