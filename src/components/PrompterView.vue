@@ -131,6 +131,7 @@ const isAutoScrolling = ref(settings.value.enableAutoScroll);
 let scrollAccumulator = 0;
 let animFrameId: number | null = null;
 let lastScrollTimestamp = 0;
+let isProgrammaticScroll = false;
 
 // 語音跟隨統一捲動控制器：語音只設定目標，由同一個 rAF 迴圈做平滑趨近，
 // 避免每個 token 觸發一次原生 smooth scroll 互相搶奪造成抖動
@@ -151,26 +152,26 @@ function runAutoScrollLoop(timestamp: number) {
 
   const container = scrollContainerRef.value;
   if (container) {
+    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
     const hasFreshVoiceTarget = settings.value.enableVoice &&
       voiceScrollTarget !== null &&
       timestamp - lastVoiceTargetAt < 3000 &&
       timestamp - lastManualScrollAt > 2500;
 
     if (hasFreshVoiceTarget && voiceScrollTarget !== null) {
-      const diff = voiceScrollTarget - scrollAccumulator;
-      if (Math.abs(diff) < 1) {
-        scrollAccumulator = voiceScrollTarget;
-        container.scrollTop = scrollAccumulator;
-      } else if (reduceMotion) {
-        scrollAccumulator = voiceScrollTarget;
-        container.scrollTop = scrollAccumulator;
+      const clampedTarget = Math.max(0, Math.min(voiceScrollTarget, maxScroll));
+      const diff = clampedTarget - scrollAccumulator;
+      if (Math.abs(diff) < 1 || reduceMotion) {
+        scrollAccumulator = clampedTarget;
       } else {
         scrollAccumulator += diff * Math.min(1, deltaSeconds * 5);
-        container.scrollTop = scrollAccumulator;
       }
+      isProgrammaticScroll = true;
+      container.scrollTop = scrollAccumulator;
     } else if (settings.value.enableAutoScroll && isAutoScrolling.value) {
       const speedPxPerSec = 4 + settings.value.scrollSpeed * 16;
-      scrollAccumulator += speedPxPerSec * deltaSeconds;
+      scrollAccumulator = Math.min(maxScroll, scrollAccumulator + speedPxPerSec * deltaSeconds);
+      isProgrammaticScroll = true;
       container.scrollTop = scrollAccumulator;
     }
   }
@@ -181,11 +182,13 @@ function runAutoScrollLoop(timestamp: number) {
 // 監聽容器手動滾動（滑鼠滾輪/觸控手勢/捲軸拖曳），同步累計器並短暫抑制語音拉回
 function handleContainerScroll() {
   if (!scrollContainerRef.value) return;
-  const current = scrollContainerRef.value.scrollTop;
-  if (Math.abs(current - scrollAccumulator) > 2) {
-    scrollAccumulator = current;
-    lastManualScrollAt = performance.now();
+  if (isProgrammaticScroll) {
+    isProgrammaticScroll = false;
+    return;
   }
+  const current = scrollContainerRef.value.scrollTop;
+  scrollAccumulator = current;
+  lastManualScrollAt = performance.now();
 }
 
 // 切換自動滾動開關 (獨立開關)
@@ -257,6 +260,7 @@ onMounted(() => {
   animFrameId = requestAnimationFrame(runAutoScrollLoop);
   window.addEventListener('keydown', handleKeyDown);
   document.addEventListener('fullscreenchange', handleFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
   // 閒置偵測：觸碰/點按/按鍵都算活動，3 秒無活動自動隱藏工具列
   window.addEventListener('touchstart', onUserActive, { passive: true });
   window.addEventListener('touchmove', onUserActive, { passive: true });
@@ -289,6 +293,7 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onUserActive);
   window.removeEventListener('keydown', handleKeyDown);
   document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
 });
 
 // 當前語音朗讀字詞改變時，只設定跟隨目標，由 rAF 迴圈平滑趨近（避免連發 smooth scroll 打架抖動）
@@ -304,7 +309,7 @@ watch(currentTokenIndex, (newIdx) => {
     const elRect = el.getBoundingClientRect();
 
     const offset = elRect.top - containerRect.top;
-    const targetScrollTop = container.scrollTop + offset - (containerRect.height / 2) + (elRect.height / 2);
+    const targetScrollTop = Math.max(0, container.scrollTop + offset - (containerRect.height / 2) + (elRect.height / 2));
 
     // 微小位移不更新目標，減少逐字推進時的抖動
     if (voiceScrollTarget !== null && Math.abs(targetScrollTop - voiceScrollTarget) < 24) return;
@@ -324,21 +329,43 @@ watch(settings, (newVal) => {
   emit('update-settings', { ...newVal });
 }, { deep: true });
 
-// 全螢幕切換
+// 全螢幕切換（支援跨瀏覽器 / WebKit）
 async function toggleFullscreen() {
-  if (!document.fullscreenElement) {
-    await document.documentElement.requestFullscreen().catch(() => {});
+  const doc = document as any;
+  const docEl = document.documentElement as any;
+  const isFs = !!(doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement || doc.msFullscreenElement);
+  if (!isFs) {
+    if (docEl.requestFullscreen) {
+      await docEl.requestFullscreen().catch(() => {});
+    } else if (docEl.webkitRequestFullscreen) {
+      docEl.webkitRequestFullscreen();
+    } else if (docEl.msRequestFullscreen) {
+      docEl.msRequestFullscreen();
+    }
   } else {
-    await document.exitFullscreen().catch(() => {});
+    if (doc.exitFullscreen) {
+      await doc.exitFullscreen().catch(() => {});
+    } else if (doc.webkitExitFullscreen) {
+      doc.webkitExitFullscreen();
+    } else if (doc.msExitFullscreen) {
+      doc.msExitFullscreen();
+    }
   }
 }
 
 function handleFullscreenChange() {
-  isFullscreen.value = !!document.fullscreenElement;
+  const doc = document as any;
+  isFullscreen.value = !!(doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement || doc.msFullscreenElement);
 }
 
 // 鍵盤快速鍵
 function handleKeyDown(e: KeyboardEvent) {
+  // 若焦點在輸入框或選擇器，不攔截打字按鍵
+  const target = e.target as HTMLElement | null;
+  if (target && target.matches('input, textarea, select')) {
+    return;
+  }
+
   // 空白鍵：播放 / 暫停
   if (e.code === 'Space') {
     e.preventDefault();
@@ -376,16 +403,24 @@ function handleKeyDown(e: KeyboardEvent) {
   else if (e.code === 'ArrowUp') {
     e.preventDefault();
     if (scrollContainerRef.value) {
-      scrollAccumulator = Math.max(0, scrollAccumulator - 60);
-      scrollContainerRef.value.scrollTop = scrollAccumulator;
+      const container = scrollContainerRef.value;
+      const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+      scrollAccumulator = Math.max(0, Math.min(maxScroll, scrollAccumulator - 60));
+      isProgrammaticScroll = true;
+      container.scrollTop = scrollAccumulator;
+      lastManualScrollAt = performance.now();
     }
   }
   // 方向鍵下：向下手動滾動
   else if (e.code === 'ArrowDown') {
     e.preventDefault();
     if (scrollContainerRef.value) {
-      scrollAccumulator += 60;
-      scrollContainerRef.value.scrollTop = scrollAccumulator;
+      const container = scrollContainerRef.value;
+      const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+      scrollAccumulator = Math.max(0, Math.min(maxScroll, scrollAccumulator + 60));
+      isProgrammaticScroll = true;
+      container.scrollTop = scrollAccumulator;
+      lastManualScrollAt = performance.now();
     }
   }
   // 'F' 鍵：全螢幕

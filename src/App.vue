@@ -70,8 +70,9 @@ function handleEditScript(script: ScriptItem) {
 }
 
 // 儲存文稿
-async function handleSaveScript(payload: Partial<ScriptItem>) {
+async function handleSaveScript(payload: Partial<ScriptItem>): Promise<number | undefined> {
   try {
+    let scriptId = payload.id;
     if (payload.id) {
       await db.scripts.update(payload.id, payload);
     } else {
@@ -84,18 +85,27 @@ async function handleSaveScript(payload: Partial<ScriptItem>) {
         speechDurationSeconds: payload.speechDurationSeconds || 0,
         tags: payload.tags || []
       });
-      payload.id = newId as number;
+      scriptId = newId as number;
+      payload.id = scriptId;
     }
     await loadData();
     showToast('文稿已成功儲存至本機資料庫！');
+    return scriptId;
   } catch (err) {
     console.error('Failed to save script:', err);
     showToast('儲存失敗，請重試');
+    return undefined;
   }
 }
 
 // 開始提詞
-function handleStartPrompter(script: ScriptItem) {
+async function handleStartPrompter(script: ScriptItem) {
+  if (!script.id) {
+    const newId = await handleSaveScript(script);
+    if (newId) {
+      script.id = newId;
+    }
+  }
   selectedScript.value = script;
   currentView.value = 'prompter';
 }

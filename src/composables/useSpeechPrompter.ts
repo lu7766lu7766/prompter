@@ -157,7 +157,9 @@ export function useSpeechPrompter() {
     lines.forEach((line, lineIdx) => {
       let i = 0;
       while (i < line.length) {
-        const char = line[i];
+        const codePoint = line.codePointAt(i) || 0;
+        const char = String.fromCodePoint(codePoint);
+        const charLen = char.length;
 
         // 判斷是否為英數字詞
         if (/[a-zA-Z0-9]/.test(char)) {
@@ -179,7 +181,7 @@ export function useSpeechPrompter() {
             isPunctuationOrSpace: true,
             isNewline: false
           });
-          i++;
+          i += charLen;
         } else if (/[，。！？、；：「」『』（）《》〈〉—…,.!?;:()\[\]"']/.test(char)) {
           list.push({
             id: id++,
@@ -187,16 +189,16 @@ export function useSpeechPrompter() {
             isPunctuationOrSpace: true,
             isNewline: false
           });
-          i++;
+          i += charLen;
         } else {
-          // 中文字元或其他 Unicode 字元
+          // 中文字元或其他 Unicode 字元（含 Emoji / 延伸區字元）
           list.push({
             id: id++,
             text: char,
             isPunctuationOrSpace: false,
             isNewline: false
           });
-          i++;
+          i += charLen;
         }
       }
 
@@ -400,9 +402,14 @@ export function useSpeechPrompter() {
 
   // 啟用螢幕常亮 (Screen Wake Lock API)
   async function requestWakeLock() {
-    if ('wakeLock' in navigator) {
+    if (typeof navigator !== 'undefined' && 'wakeLock' in navigator) {
       try {
-        wakeLock = await (navigator as any).wakeLock.request('screen');
+        const lock = await (navigator as any).wakeLock.request('screen');
+        if (!shouldKeepListening) {
+          lock.release().catch(() => {});
+          return;
+        }
+        wakeLock = lock;
       } catch (err) {
         console.warn('Wake Lock request failed:', err);
       }
@@ -416,18 +423,37 @@ export function useSpeechPrompter() {
     }
   }
 
+  // 監聽頁面能見度變更，切換回前景時自動補回常亮與恢復 AudioContext
+  function handleVisibilityChange() {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible' && shouldKeepListening) {
+      requestWakeLock();
+      if (audioContext && audioContext.state === 'suspended') {
+        audioContext.resume().catch(() => {});
+      }
+    }
+  }
+
   // 麥克風音量即時監聽（含降噪約束 + 平滑，避免環境音瞬間峰值誤觸）
   async function startAudioMonitor() {
     // 防重入：已有監聽先拆掉，避免重試啟動時佔用兩條音軌
     stopAudioMonitor();
     try {
+      let stream: MediaStream;
       try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({
+        stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
         });
       } catch {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       }
+
+      // 非同步等待授權期間，若使用者已停止辨識或頁面已卸載，立即釋放音軌防洩漏
+      if (!shouldKeepListening) {
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+
+      mediaStream = stream;
       audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       const source = audioContext.createMediaStreamSource(mediaStream);
       analyser = audioContext.createAnalyser();
@@ -437,7 +463,7 @@ export function useSpeechPrompter() {
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let smoothed = 0;
       const updateVolume = () => {
-        if (!analyser) return;
+        if (!analyser || !shouldKeepListening) return;
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < dataArray.length; i++) {
@@ -460,6 +486,7 @@ export function useSpeechPrompter() {
       cancelAnimationFrame(animFrameId);
       animFrameId = null;
     }
+    analyser = null;
     if (mediaStream) {
       mediaStream.getTracks().forEach(t => t.stop());
       mediaStream = null;
@@ -473,6 +500,7 @@ export function useSpeechPrompter() {
 
   // 初始化並開始語音識別
   function startListening() {
+    if (shouldKeepListening && isListening.value) return;
     errorMessage.value = '';
     const SpeechRecognitionClass = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognitionClass) {
@@ -481,6 +509,9 @@ export function useSpeechPrompter() {
     }
 
     shouldKeepListening = true;
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
 
     try {
       // 全新會話狀態；實例一律由 doBoot 建立（首次與重連皆然，避免沿用卡死實例）
@@ -548,9 +579,10 @@ export function useSpeechPrompter() {
       };
 
     r.onerror = (event: any) => {
+        if (!shouldKeepListening) return;
         const code = event?.error as string | undefined;
-        if (code === 'no-speech') {
-          // 靜音屬正常現象，不報錯（onend 會接著觸發重連）
+        if (code === 'no-speech' || code === 'aborted') {
+          // 靜音或主動中斷屬正常現象，不報錯也不重複排程
           return;
         }
         if (code === 'not-allowed' || code === 'service-not-allowed') {
@@ -715,6 +747,9 @@ export function useSpeechPrompter() {
     isListening.value = false;
     isReconnecting.value = false;
     interimText.value = '';
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }
     stopWatchdog();
     destroyRecognitionInstance();
     stopAudioMonitor();
