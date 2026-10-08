@@ -319,15 +319,23 @@ export function useSpeechPrompter() {
     const maxLocalLen = Math.min(cleanedTranscript.length, 12);
     for (let len = maxLocalLen; len >= 2; len--) {
       // 短 anchor 只允許推進一小步時使用，避免 2~3 字重複詞亂跳：
-      // 非 final 且 len < 4 時，只接受「向前小步」（40 字內）
       const sub = cleanedTranscript.slice(-len);
       const found = findNearest(localSlice, sub, localAnchor);
       if (found !== -1) {
         const absIdx = localStart + found + len - 1;
         const delta = absIdx - currentCharPos;
-        if (!isFinal && len < 4 && (delta < 0 || delta > 40)) continue;
-        // 後退需較強證據：interim 後退只接受 len >= 5
+
+        // 短 anchor (len < 4，如 2~3 字常見詞)：無論 final 與否，極易在長文中重複，
+        // 只允許就近向前小步跟隨（-4 到 +40 字以內），嚴禁大幅後退或大步向前跳
+        if (len < 4 && (delta < -4 || delta > 40)) continue;
+
+        // 後退需較強證據（朗讀主要為向前推進）：
+        // - interim 後退只接受 len >= 5
+        // - final 中度後退 (delta < -10) 需要 len >= 5；大幅後退 (delta < -30) 需要 len >= 8
         if (!isFinal && delta < 0 && len < 5) continue;
+        if (isFinal && delta < -10 && len < 5) continue;
+        if (isFinal && delta < -30 && len < 8) continue;
+
         commitCharIndex(absIdx);
         // 窗內命中即清除遠跳待確認（已回到正常跟隨）
         pendingFarCharIndex = -1;
@@ -500,7 +508,7 @@ export function useSpeechPrompter() {
       restartAttempts = 0;
       isListening.value = true;
       isReconnecting.value = false;
-      if (!sessionStartAt) sessionStartAt = Date.now();
+      sessionStartAt = Date.now();
       errorMessage.value = '';
     };
 
@@ -588,6 +596,8 @@ export function useSpeechPrompter() {
     const r = recognition;
     recognition = null;
     starting = false;
+    pendingFarCharIndex = -1;
+    pendingFarHits = 0;
     if (r) {
       r.onstart = null;
       r.onresult = null;
@@ -642,8 +652,8 @@ export function useSpeechPrompter() {
   }
 
   // 看門狗：每 2 秒檢查一次
-  // 1) 有音量（使用者正在說話）卻久無辨識結果 → 實例已 wedged，重建
-  // 2) 單一會話超過約 4 分鐘 → 預防性重建，繞過 Chrome 長會話自動斷線
+  // 1) 有音量（使用者正在說話）卻久無辨識結果 → 實例已卡死 (wedged)，重建並給予寬限期杜絕死循環
+  // 2) 預防性重建：單一會話超過 5 分鐘且使用者處於靜音停頓時才重建，嚴禁在發話途中暴力切斷
   // 3) AudioContext 被系統暫停 → 嘗試恢復，讓音量條與閘門保持可信
   function startWatchdog() {
     stopWatchdog();
@@ -660,19 +670,29 @@ export function useSpeechPrompter() {
         audioContext.resume().catch(() => {});
       }
 
-      const speakingRecently = now - lastLoudAt < 5000;
-      const resultAge = lastResultAt.value === 0 ? now - sessionStartAt : now - lastResultAt.value;
-      // 使用者有在說話、會話已開始超過 12 秒，卻 10 秒以上無結果 → 重建
-      if (speakingRecently && sessionStartAt > 0 && now - sessionStartAt > 12000 && resultAge > 10000) {
+      // 使用者最近 3.5 秒內是否有發話
+      const speakingRecently = lastLoudAt > 0 && now - lastLoudAt < 3500;
+      // 距上次收到辨識結果經過的時間（若尚未收到任何結果，以會話啟動時間起算）
+      const resultAge = lastResultAt.value === 0
+        ? (sessionStartAt > 0 ? now - sessionStartAt : 0)
+        : now - lastResultAt.value;
+
+      // 狀況 1：會話已啟動超過 15 秒（給予連線握手充分寬限期），使用者持續發話但超過 12 秒無任何結果流入 → 卡死修復
+      if (speakingRecently && sessionStartAt > 0 && now - sessionStartAt > 15000 && resultAge > 12000) {
+        console.warn('Speech recognition wedged detected, restarting session...');
+        sessionStartAt = now;
+        lastResultAt.value = now; // 關鍵修復：重設為目前時間，給予新實例完整寬限期，杜絕每 2 秒重啟死循環
         destroyRecognitionInstance();
         scheduleRestart(400);
         return;
       }
 
-      // 預防性重建：單一會話超過 4 分鐘（位置保留在 currentTokenIndex，不受影響）
-      if (sessionStartAt > 0 && now - sessionStartAt > 4 * 60 * 1000) {
+      // 狀況 2：超長會話（> 5 分鐘）預防性維護：
+      // 絕對不可在發話中切斷！必須在使用者「處於靜音停頓且至少 3 秒沒聲音」時才執行平滑維護
+      const isSilentPause = !speakingRecently && (lastLoudAt === 0 || now - lastLoudAt > 3000);
+      if (sessionStartAt > 0 && now - sessionStartAt > 5 * 60 * 1000 && isSilentPause) {
         sessionStartAt = now;
-        lastResultAt.value = 0;
+        lastResultAt.value = now;
         destroyRecognitionInstance();
         scheduleRestart(400);
       }
